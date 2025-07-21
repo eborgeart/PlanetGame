@@ -35,10 +35,6 @@
 			"Name": "CMAA2",
 			"Enabled": true,
 			"MarketplaceURL": "com.epicgames.launcher://ue/Fab/product/4a7f6588-159d-4b2b-aa7f-1b5dbb95fa69"
-		},
-		{
-			"Name": "ConsoleVariables",
-			"Enabled": true
 		}
 	]
 }
