@@ -50,5 +50,11 @@
 				"Android"
 			]
 		}
+	],
+	"TargetPlatforms": [
+		"Linux",
+		"LinuxArm64",
+		"Mac",
+		"Windows"
 	]
 }
