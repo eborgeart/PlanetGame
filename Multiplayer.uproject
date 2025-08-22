@@ -99,6 +99,10 @@
 		{
 			"Name": "GoogleCloudMessaging",
 			"Enabled": false
+		},
+		{
+			"Name": "Volumetrics",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [
