@@ -107,6 +107,14 @@
 		{
 			"Name": "PhysicsControl",
 			"Enabled": true
+		},
+		{
+			"Name": "EasyMultiSave",
+			"Enabled": true
+		},
+		{
+			"Name": "GeneSplicer",
+			"Enabled": false
 		}
 	],
 	"TargetPlatforms": [
