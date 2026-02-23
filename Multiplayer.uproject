@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "{1E6C4F88-4FB8-2A25-3077-258616EDFFFD}",
+	"EngineAssociation": "5.6",
 	"Category": "",
 	"Description": "",
 	"Plugins": [
@@ -106,6 +106,10 @@
 		},
 		{
 			"Name": "PhysicsControl",
+			"Enabled": true
+		},
+		{
+			"Name": "EasyMultiSave",
 			"Enabled": true
 		},
 		{
