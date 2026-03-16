@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "5.6",
+	"EngineAssociation": "5.7",
 	"Category": "",
 	"Description": "",
 	"Plugins": [
@@ -33,8 +33,8 @@
 		},
 		{
 			"Name": "CMAA2",
-			"Enabled": false,
-			"MarketplaceURL": "com.epicgames.launcher://ue/Fab/product/4a7f6588-159d-4b2b-aa7f-1b5dbb95fa69"
+			"Enabled": true,
+			"MarketplaceURL": "com.epicgames.launcher://ue/Fab/product/74b323b8-265d-4f19-b5b6-305c3129d6e4"
 		},
 		{
 			"Name": "FastNoiseGenerator",
@@ -115,6 +115,11 @@
 		{
 			"Name": "GeneSplicer",
 			"Enabled": false
+		},
+		{
+			"Name": "ScreenSpaceFogScattering",
+			"Enabled": true,
+			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/260929cfa39b43238302154c98311fc7"
 		}
 	],
 	"TargetPlatforms": [
