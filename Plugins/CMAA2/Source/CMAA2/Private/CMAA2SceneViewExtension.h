@@ -150,6 +150,9 @@ class FDeferredColorApplyCS : public FGlobalShader
 	SHADER_USE_PARAMETER_STRUCT(FDeferredColorApplyCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
+		SHADER_PARAMETER(FVector2f, SceneColorTextureSize)
 		SHADER_PARAMETER_SAMPLER(SamplerState, g_gather_point_clamp_Sampler)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, g_inoutColorWriteonly)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, g_workingDeferredBlendLocationList)

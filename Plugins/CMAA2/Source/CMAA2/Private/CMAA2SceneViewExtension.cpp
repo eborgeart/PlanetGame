@@ -5,6 +5,9 @@
 #include "RenderGraphUtils.h"
 #include "ScenePrivate.h"
 #include "ShaderParameterUtils.h"
+#include "SceneView.h"
+#include "SceneTextures.h"
+#include "SceneTextureParameters.h"
 
 IMPLEMENT_GLOBAL_SHADER(FDetectEdgesCS, "/Plugin/CMAA2/CMAA2.usf", "EdgesColor2x2CS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FComputeDispatchArgsCS, "/Plugin/CMAA2/CMAA2.usf", "ComputeDispatchArgsCS", SF_Compute);
@@ -251,6 +254,11 @@ FScreenPassTexture FCMAA2SceneViewExtension::RenderCMAA2(FRDGBuilder& GraphBuild
 		PassParameters->g_inoutColorReadonly = SceneColor.Texture;
 		PassParameters->ViewOffset = ViewOffset;
 		PassParameters->IndirectArgsBuffer = IndirectArgs2Read;
+		PassParameters->SceneColorTexture = SceneColor.Texture;
+		PassParameters->SceneColorSampler = TStaticSamplerState<SF_Point>::GetRHI();
+		PassParameters->SceneColorTextureSize =
+			FVector2f(SceneColor.Texture->Desc.Extent);
+
 		
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeferredColorApply"), DeferredColorApplyCS, PassParameters, IndirectArgs2Read, 0);
 	}
