@@ -44,7 +44,6 @@
 
 #endif
 
-
 // Constants that C++/API side needs to know!
 #define CMAA_PACK_SINGLE_SAMPLE_EDGE_TO_HALF_WIDTH  1   // adds more ALU but reduces memory use for edges by half by packing two 4 bit edge info into one R8_UINT texel - helps on all HW except at really low res
 #define CMAA2_CS_INPUT_KERNEL_SIZE_X                16
@@ -62,12 +61,12 @@
 // Luma-based edge detection has a slightly lower quality but better performance so use it as a default; providing luma as a separate texture (or .a channel of the main one) will improve performance.
 // See RGBToLumaForEdges for luma conversions in non-HDR and HDR versions.
 #ifndef CMAA2_EDGE_DETECTION_LUMA_PATH
-#define CMAA2_EDGE_DETECTION_LUMA_PATH 2
+#define CMAA2_EDGE_DETECTION_LUMA_PATH 0
 #endif
 
 // for CMAA2+MSAA support
 #ifndef CMAA_MSAA_SAMPLE_COUNT
-#define CMAA_MSAA_SAMPLE_COUNT 4
+#define CMAA_MSAA_SAMPLE_COUNT 1
 #endif
 
 #define CMAA2_CS_OUTPUT_KERNEL_SIZE_X               (CMAA2_CS_INPUT_KERNEL_SIZE_X-2)
@@ -201,15 +200,6 @@ Texture2D<lpfloat>              g_inColorMSComplexityMaskReadonly   : register( 
 #else
 Texture2D<lpfloat4>             g_inoutColorReadonly                : register( t0 );       // input color
 #endif
-
-// === Scene Color (raw scene before CMAA2) ===
-Texture2D<float4> SceneColorTexture : register(t10);
-SamplerState SceneColorSampler : register(s10);
-
-cbuffer SceneColorInfo : register(b10)
-{
-    float2 SceneColorTextureSize;
-};
 
 #if CMAA2_EDGE_DETECTION_LUMA_PATH == 2
 Texture2D<float>                g_inLumaReadonly                    : register( t3 );
@@ -1340,80 +1330,6 @@ void ProcessCandidatesCS( uint3 dispatchThreadID : SV_DispatchThreadID, uint3 gr
 #endif
 
 }
-// ============================================================================
-// Shadow Ring Fix — Multi‑Radius, Smooth Averaging Version
-// ============================================================================
-lpfloat3 ExtendShadowsColor(uint2 pixelPos, lpfloat3 color)
-{
-    // --- Tunable parameters ---
-    const lpfloat threshold  = 0.001;   // sensitivity to brightness difference
-    const lpfloat strength   = .7;    // how strongly to darken
-    const int     maxRadius  = 3;       // how far to search (3–5 recommended)
-
-    // --- Base luminance ---
-    lpfloat baseLum = dot(color, lpfloat3(0.299, 0.587, 0.114));
-
-    lpfloat3 accum = lpfloat3(0,0,0);
-    lpfloat  count = 0;
-
-    // --- Multi‑radius search (progressively outward) ---
-    [loop]
-    for (int r = 1; r <= maxRadius; r++)
-    {
-        // 8‑direction sampling at radius r
-        const int2 Offsets[8] = {
-            int2( r,  0), int2(-r,  0),
-            int2( 0,  r), int2( 0, -r),
-            int2( r,  r), int2(-r,  r),
-            int2( r, -r), int2(-r, -r)
-        };
-
-        [unroll]
-        for (int i = 0; i < 8; i++)
-        {
-            int2 p = int2(pixelPos) + Offsets[i];
-
-            lpfloat3 n;
-        #if CMAA_MSAA_SAMPLE_COUNT > 1
-            n = LoadSourceColor(uint2(p), int2(0,0), 0);
-        #else
-            int2 samplePos = p + int2(ViewOffset);
-            float2 uv = (float2(samplePos) + 0.5) / SceneColorTextureSize;
-            lpfloat3 n = SceneColorTexture.SampleLevel(SceneColorSampler, uv, 0).rgb;
-        #endif
-
-            lpfloat lumN = dot(n, lpfloat3(0.299, 0.587, 0.114));
-
-            // Only accumulate darker neighbors
-            if (lumN < baseLum)
-            {
-                accum += n;
-                count += 1;
-            }
-        }
-
-        // If we found darker pixels at this radius, stop expanding
-        if (count > 0)
-            break;
-    }
-
-    // No darker neighbors found → do nothing
-    if (count == 0)
-        return color;
-
-    // Average of darker neighbors
-    lpfloat3 avg = accum / count;
-
-    // How different is the darker region?
-    lpfloat avgLum = dot(avg, lpfloat3(0.299, 0.587, 0.114));
-    lpfloat diff   = baseLum - avgLum;
-
-    // Mask: only apply if difference is meaningful
-    lpfloat mask = step(threshold, diff);
-
-    // Blend toward darker region
-    return lerp(color, avg, mask * strength);
-}
 
 #if CMAA2_DEFERRED_APPLY_THREADGROUP_SWAP
 [numthreads( 4, CMAA2_DEFERRED_APPLY_NUM_THREADS, 1 )]
@@ -1502,11 +1418,7 @@ void DeferredColorApply2x2CS( uint3 dispatchThreadID : SV_DispatchThreadID, uint
         lpfloat4 outColor = outColors;
         outColor.rgb /= outColor.a;
 #endif
-// Apply shadow-ring fix
-lpfloat3 finalColor = ExtendShadowsColor(pixelPos, outColor.rgb);
-
-// Write final color
-FinalUAVStore(pixelPos + ViewOffset, finalColor);
+        FinalUAVStore( pixelPos + ViewOffset, lpfloat3(outColor.rgb) );
     }
 }
 
