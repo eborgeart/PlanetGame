@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"Version": 3,
+	"VersionName": "1.02",
+	"FriendlyName": "Conservative Morphological Anti-Aliasing 2 (CMAA2)",
+	"Description": "Post-process anti-aliasing solution focused on providing good results while retaining the sharpness of the image at minimal execution cost.",
+	"Category": "Rendering",
+	"CreatedBy": "Dmitry Karpukhin",
+	"CreatedByURL": "com.epicgames.launcher://ue/marketplace/profile/Dmitry+Karpukhin",
+	"DocsURL": "https://dmkarpukhin.com/docs/cmaa2/",
+	"MarketplaceURL": "com.epicgames.launcher://ue/Fab/product/74b323b8-265d-4f19-b5b6-305c3129d6e4",
+	"SupportURL": "mailto:skxdoom@gmail.com",
+	"EngineVersion": "5.7.0",
+	"CanContainContent": false,
+	"Installed": true,
+	"Modules": [
+		{
+			"Name": "CMAA2",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		}
+	]
+}

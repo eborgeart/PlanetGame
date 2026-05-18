@@ -142,11 +142,11 @@ static const uint c_maxLineLength = 86;
 #if CMAA2_STATIC_QUALITY_PRESET == 0   // LOW
     #define g_CMAA2_EdgeThreshold                   lpfloat(0.15)
 #elif CMAA2_STATIC_QUALITY_PRESET == 1 // MEDIUM
-    #define g_CMAA2_EdgeThreshold                   lpfloat(0.10)
+    #define g_CMAA2_EdgeThreshold                   lpfloat(0.8)
 #elif CMAA2_STATIC_QUALITY_PRESET == 2 // HIGH (default)
-    #define g_CMAA2_EdgeThreshold                   lpfloat(0.07)
+    #define g_CMAA2_EdgeThreshold                   lpfloat(0.03)
 #elif CMAA2_STATIC_QUALITY_PRESET == 3 // ULTRA
-    #define g_CMAA2_EdgeThreshold                   lpfloat(0.05)
+    #define g_CMAA2_EdgeThreshold                   lpfloat(0.01)
 #else
     #error CMAA2_STATIC_QUALITY_PRESET not set?
 #endif
