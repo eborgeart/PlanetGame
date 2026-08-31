@@ -131,6 +131,11 @@
 			"Name": "SnapSystem",
 			"Enabled": true,
 			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/fa834687594944f5aafe2be8b44ad3f1"
+		},
+		{
+			"Name": "CMAA2",
+			"Enabled": false,
+			"MarketplaceURL": "com.epicgames.launcher://ue/Fab/product/74b323b8-265d-4f19-b5b6-305c3129d6e4"
 		}
 	],
 	"TargetPlatforms": [
