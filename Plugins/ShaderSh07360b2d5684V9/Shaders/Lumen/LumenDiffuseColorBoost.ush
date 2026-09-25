@@ -1,0 +1,34 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// [generated] ShaderShift live-lane neutralization -- Build/gen_live_slots.py.
+// When the ShaderShift live-tweak marker is armed, the View *OverrideParameter
+// members carry live-slot data, so the editor-viewmode override transforms must
+// not be applied.  Unarmed (or SHADERSHIFT_LIVE_TWEAKS==0) is engine-identical.
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+#ifndef SSL_NEUTRAL
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_NEUTRAL(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#else
+#define SSL_NEUTRAL(SYM) false
+#endif
+#endif
+
+
+#pragma once
+
+// Optionally boost albedo, but don't allow it to reach 1 as multi-bounce would explode
+float3 ApplyDiffuseColorBoost(float3 DiffuseColor, float DiffuseColorBoost)
+{
+	if (DiffuseColorBoost < 1.0f)
+	{
+		float DiffuseLum = Luminance(DiffuseColor);
+		float DiffuseLumBoost = pow(DiffuseLum, DiffuseColorBoost);
+		DiffuseColor = min(saturate(DiffuseColor * (DiffuseLumBoost / max(DiffuseLum, 1e-8f))), 0.99f);
+	}
+
+	DiffuseColor = SSL_NEUTRAL(View) ? (DiffuseColor.rgb) : (DiffuseColor.rgb * View.DiffuseOverrideParameter.w + View.DiffuseOverrideParameter.xyz); // ShaderShift live-lane guard
+
+	return DiffuseColor;
+}

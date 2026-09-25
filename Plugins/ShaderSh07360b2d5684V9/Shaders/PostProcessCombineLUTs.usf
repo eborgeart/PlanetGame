@@ -1,0 +1,1369 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Modified by TonemapOverride Plugin
+
+/*=============================================================================
+	LUTBlender.usf: Filter pixel shader source.   
+
+	This file shadows Engine/Shaders/Private/PostProcessCombineLUTs.usf.
+	The TonemapOverride plugin injects custom tonemapping operators at the
+	LUT baking stage (FilmToneMap call), so color grading works properly.
+
+	Note: Any changes to device encoding logic in CombineLUTsCommon() must
+	also be made in PostProcessDeviceEncodingOnly.usf.
+=============================================================================*/
+
+#define USE_COLOR_MATRIX	1
+#define USE_SHADOW_TINT		1
+#define USE_CONTRAST		1
+
+#include "Common.ush"
+#include "PostProcessCommon.ush"
+#include "TonemapCommon.ush"
+
+// Values:
+//   0 = ACES Filmic (engine default FilmToneMap)
+//   1 = AgX (Punchy)
+//   2 = Reinhard
+//   3 = Linear (no tonemapping)
+//   4 = Custom (see CustomTonemapOperator below)
+//   5 = Gran Turismo "GT Tonemap" (Uchimura 2017)
+//   6 = Gran Turismo 7 (2025) physically-based / perceptual tonemap
+//   7 = Apex (ShaderShift) — AgX chroma handling + GT display-peak tonescale
+//   8 = Prism (ShaderShift) — hue-preserving luminance + fit-to-peak desat
+
+
+#define CUSTOM_TONEMAP_MODE 1  // Change this to switch tonemappers
+
+
+// 0: Default, 1: Golden, 2: Punchy
+
+#define AGX_LOOK 2
+
+
+// ── Gran Turismo "GT Tonemap" parameters [Uchimura 2017, "HDR theory and
+// practice"] — desmos.com/calculator/gslcdxvipg.  Per-channel curve in
+// linear sRGB: toe (pow) -> linear midsection -> exponential shoulder.
+#define GT_PEAK              1.0   // P  max display value
+#define GT_CONTRAST          1.0   // a  contrast / linear-section slope
+#define GT_LINEAR_START      0.22  // m  where the linear section begins
+#define GT_LINEAR_LENGTH     0.4   // l  length of the linear section
+#define GT_TOE_CURVE         1.33  // c  black tightness (toe power)
+#define GT_TOE_OFFSET        0.0   // b  pedestal / black offset
+
+// ── HDR output handling ──────────────────────────────────────────────────────
+// When a custom tonemapper (CUSTOM_TONEMAP_MODE != 0) is active AND the output
+// device is an HDR mode (ACES ST2084 / scRGB), the engine would normally ignore
+// the custom tonemap and run the ACES Output Transform on the un-tonemapped
+// GradedColor.  With CUSTOM_HDR_PARITY enabled we instead route the custom
+// tonemapper to the HDR signal:
+//
+//   * CUSTOM_HDR_NATIVE = 1 (default): GT (mode 5) and GT7 (mode 6) tone-map to
+//     the display's actual peak luminance (OutputMaxLuminance) and use the full
+//     HDR range — true HDR, with proper highlight roll-off to the display peak.
+//     Both curves carry an explicit peak parameter built for this (GT7's
+//     framebufferLuminanceTarget_, Uchimura's P).
+//   * All OTHER modes (AgX, Reinhard, Custom, …) fall back to SDR-parity: the
+//     display-referred FilmColor is presented at CUSTOM_HDR_PAPER_WHITE nits, so
+//     HDR matches SDR.  (Those curves saturate to [0,1] and have no display-peak
+//     parameter — making them exploit HDR needs a curve reformulation; see
+//     Docs/Tonemappers_HDR_Parity.md.)
+//
+// Set CUSTOM_HDR_PARITY 0 to fall back to the engine ACES HDR ODT.
+// Set CUSTOM_HDR_NATIVE 0 to force GT/GT7 to SDR-parity too.
+#define CUSTOM_HDR_PARITY        1
+#define CUSTOM_HDR_NATIVE        1
+// SDR reference-white luminance for the parity mapping (nits).  100 matches UE's
+// 1.0-linear = 100 cd/m^2 convention; 200 is a common brighter SDR paper white.
+#define CUSTOM_HDR_PAPER_WHITE   100.0
+// Highlight-expansion knee for SDR-domain tonemappers taken into HDR (AgX mode 1,
+// Reinhard mode 2, Custom/Hable mode 4): display value above this knee rolls up
+// to the display peak; below it stays at the SDR reference.  Lower = more
+// aggressive HDR highlights; higher = more SDR-like.  Range ~0.6-0.9.
+#define CUSTOM_HDR_EXPAND_KNEE   0.75
+
+// ── Apex (mode 7) ─ AgX chroma handling + GT display-peak tonescale ──────────
+// AgX's hue stability comes from its inset (pre-curve desaturation) + outset
+// (post-curve re-saturation).  Apex keeps those (controllable via APEX_INSET)
+// but drives a Uchimura GT curve to the display peak instead of AgX's fixed
+// [0,1] sigmoid — so it is HDR-native like GT/GT7 while keeping the AgX look.
+#define APEX_INSET            1.0   // 0 = none, 1 = full AgX inset (hue stability)
+#define APEX_CONTRAST         1.0   // GT curve contrast a
+#define APEX_LINEAR_START     0.22  // GT curve m
+#define APEX_LINEAR_LENGTH    0.4   // GT curve l
+#define APEX_TOE              1.33  // GT curve toe power c
+#define APEX_TOE_OFFSET       0.0   // GT curve pedestal b
+#define APEX_SAT              1.0   // final saturation (look control)
+
+// ── Prism (mode 8) ─ ShaderShift original ────────────────────────────────────
+// Hue-preserving: tone-maps LUMINANCE only (in Rec.2020) with a generalized
+// Reinhard curve (contrast + mid-gray anchor + display peak), reconstructs RGB
+// by ratio (chroma/hue exactly preserved), then applies the MINIMAL highlight
+// desaturation needed to fit the display peak (path-to-white that preserves
+// luminance & hue angle).  Vivid mids, clean roll-to-white, no per-channel hue
+// skew; HDR-native by construction (curve targets the peak).
+#define PRISM_CONTRAST        1.15  // luminance S-curve contrast
+#define PRISM_MID_IN          0.18  // scene mid-gray
+#define PRISM_MID_OUT         0.18  // display mid-gray (frame-buffer units; constant SDR/HDR)
+#define PRISM_DESAT           1.0   // 1 = full fit-to-peak (no clip); <1 = allow vivid clipping
+
+
+// Hue-preserving highlight correction.  When 1, the per-channel tonemap
+// output is replaced (at high luminance) with a luminance-scaled version of
+// the original HDR input — pre-4.17 Unreal behaviour where bright emissive
+// cores keep their colour instead of trending to white through ACES/AgX.
+// Wired to ShaderShift's "Preserve Emissive Color" checkbox.
+
+#define CUSTOM_BLOOM_PRESERVE_COLOR 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ---------------------------------------------------
+
+// Texture0 is the neutral one and is computed in the shader
+Texture2D Textures_1;
+SamplerState Samplers_1;
+Texture2D Textures_2;
+SamplerState Samplers_2;
+Texture2D Textures_3;
+SamplerState Samplers_3;
+Texture2D Textures_4;
+SamplerState Samplers_4;
+// 0 is for neutral, 1 for Textures_1, 2 for ...
+DECLARE_SCALAR_ARRAY(float, LUTWeights, 5);
+half3 ColorScale;
+half4 OverlayColor;
+
+uint bUseMobileTonemapper;
+uint bIsTemperatureWhiteBalance;
+
+float LUTSize;
+
+float WhiteTemp;
+float WhiteTint;
+
+float4 ColorSaturation;
+float4 ColorContrast;
+float4 ColorGamma;
+float4 ColorGain;
+float4 ColorOffset;
+
+float4 ColorSaturationShadows;
+float4 ColorContrastShadows;
+float4 ColorGammaShadows;
+float4 ColorGainShadows;
+float4 ColorOffsetShadows;
+
+float4 ColorSaturationMidtones;
+float4 ColorContrastMidtones;
+float4 ColorGammaMidtones;
+float4 ColorGainMidtones;
+float4 ColorOffsetMidtones;
+
+float4 ColorSaturationHighlights;
+float4 ColorContrastHighlights;
+float4 ColorGammaHighlights;
+float4 ColorGainHighlights;
+float4 ColorOffsetHighlights;
+
+float  ColorCorrectionShadowsMax;
+float  ColorCorrectionHighlightsMin;
+float  ColorCorrectionHighlightsMax;
+
+float4 ACESMinMaxData;
+float4 ACESMidData;
+float4 ACESCoefsLow_0;
+float4 ACESCoefsHigh_0;
+float ACESCoefsLow_4;
+float ACESCoefsHigh_4;
+float ACESSceneColorMultiplier;
+float ACESGamutCompression;
+
+// ACES 2.0
+Texture2D<float> ACESReachTable;
+Texture2D<float> ACESGamutTable;
+Texture2D<float> ACESGammaTable;
+
+static const float DefaultTemperature = 6500.0;
+static const float DefaultTint = 0.0;
+static const float Epsilon = 1e-8;
+
+float3 ColorCorrect( float3 WorkingColor,
+	float4 ColorSaturation,
+	float4 ColorContrast,
+	float4 ColorGamma,
+	float4 ColorGain,
+	float4 ColorOffset )
+{
+	// TODO optimize
+	float Luma = dot( WorkingColor, AP1_RGB2Y );
+	WorkingColor = max( 0, lerp( Luma.xxx, WorkingColor, ColorSaturation.xyz*ColorSaturation.w ) );
+	WorkingColor = pow( WorkingColor * (1.0 / 0.18), ColorContrast.xyz*ColorContrast.w ) * 0.18;
+	WorkingColor = pow( WorkingColor, 1.0 / (ColorGamma.xyz*ColorGamma.w) );
+	WorkingColor = WorkingColor * (ColorGain.xyz * ColorGain.w) + (ColorOffset.xyz + ColorOffset.w);
+	return WorkingColor;
+}
+
+// Nuke-style Color Correct
+float3 ColorCorrectAll( float3 WorkingColor )
+{
+	float Luma = dot( WorkingColor, AP1_RGB2Y );
+
+	// Shadow CC
+	float3 CCColorShadows = ColorCorrect(WorkingColor, 
+		ColorSaturationShadows*ColorSaturation, 
+		ColorContrastShadows*ColorContrast, 
+		ColorGammaShadows*ColorGamma, 
+		ColorGainShadows*ColorGain, 
+		ColorOffsetShadows+ColorOffset);
+	float CCWeightShadows = 1- smoothstep(0, ColorCorrectionShadowsMax, Luma);
+	
+	// Highlight CC
+	float3 CCColorHighlights = ColorCorrect(WorkingColor, 
+		ColorSaturationHighlights*ColorSaturation, 
+		ColorContrastHighlights*ColorContrast, 
+		ColorGammaHighlights*ColorGamma, 
+		ColorGainHighlights*ColorGain, 
+		ColorOffsetHighlights+ColorOffset);
+	float CCWeightHighlights = smoothstep(ColorCorrectionHighlightsMin, ColorCorrectionHighlightsMax, Luma);
+
+	// Midtone CC
+	float3 CCColorMidtones = ColorCorrect(WorkingColor, 
+		ColorSaturationMidtones*ColorSaturation, 
+		ColorContrastMidtones*ColorContrast, 
+		ColorGammaMidtones*ColorGamma, 
+		ColorGainMidtones*ColorGain, 
+		ColorOffsetMidtones+ColorOffset);
+	float CCWeightMidtones = 1 - CCWeightShadows - CCWeightHighlights;
+
+	// Blend Shadow, Midtone and Highlight CCs
+	float3 WorkingColorSMH = CCColorShadows*CCWeightShadows + CCColorMidtones*CCWeightMidtones + CCColorHighlights*CCWeightHighlights;
+	
+	return WorkingColorSMH;
+}
+
+uint OutputDevice;
+uint OutputGamut;
+float OutputMaxLuminance;
+
+uint GetOutputDevice()
+{
+#if OUTPUT_DEVICE_SRGB
+	return TONEMAPPER_OUTPUT_sRGB;
+#else
+	return OutputDevice;
+#endif
+}
+
+float BlueCorrection;
+float ExpandGamut;
+float ToneCurveAmount;
+
+// ── CUSTOM TONEMAP OPERATORS ─────────────────────────────────────────────────
+
+// AgX tonemapper (MIT License - Copyright (c) 2024 Missing Deadlines)
+// https://iolite-engine.com/blog_posts/minimal_agx_implementation
+
+// Mean error^2: 3.6705141e-06
+float3 AgxDefaultContrastApprox(float3 x)
+{
+	const float3 x2 = x * x;
+	const float3 x4 = x2 * x2;
+	
+	return + 15.5     * x4 * x2
+	       - 40.14    * x4 * x
+	       + 31.96    * x4
+	       - 6.868    * x2 * x
+	       + 0.4298   * x2
+	       + 0.1191   * x
+	       - 0.00232;
+}
+
+float3 Agx(float3 val)
+{
+	const float3x3 agx_mat = float3x3(
+		0.842479062253094,  0.0423282422610123, 0.0423756549057051,
+		0.0784335999999992, 0.878468636469772,  0.0784336,
+		0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+
+	// DEFAULT_LOG2_MIN      = -10.0
+	// DEFAULT_LOG2_MAX      =  +6.5
+	// MIDDLE_GRAY           =  0.18
+	// log2(pow(2, VALUE) * MIDDLE_GRAY)
+	// Adjusted for Unreal's zero exposure compensation
+	const float min_ev = -12.47393f; // Default: -12.47393f;
+	const float max_ev = 4.026069f;  // Default:  4.026069f; // Adjusted: 0.526069f;  //
+
+	// Avoid -INF/NaN from log2()
+	const float AgxEps = 1e-6f;
+
+	// Input transform (inset)
+	// Note: throughout UE shaders we use mul(Matrix, Vector)
+	val = mul(val, agx_mat); //val = mul(agx_mat, val);
+	
+	// Log2 space encoding
+	val = clamp(log2(max(val, AgxEps.xxx)), min_ev, max_ev);
+	val = (val - min_ev) / (max_ev - min_ev);
+  
+	// Apply sigmoid function approximation
+	val = AgxDefaultContrastApprox(val);
+	
+	return val;
+}
+
+float3 AgxEotf(float3 val)
+{
+	const float3x3 agx_mat_inv = float3x3(
+		 1.19687900512017,  -0.0528968517574562, -0.0529716355144438,
+		-0.0980208811401368, 1.15190312990417,   -0.0980434501171241,
+		-0.0990297440797205,-0.0989611768448433,  1.15107367264116);
+	
+	// Inverse input transform (outset)
+	// val = mul(val, agx_mat_inv); // Original
+	val = mul(val, agx_mat_inv); //val = mul(agx_mat_inv, val);
+	
+
+	// Clamp to non-negative before pow(): the outset matrix can produce
+	// small negative values for saturated colors, and pow(negative, 2.2)
+	// is undefined in HLSL (NaN/0), which corrupts the tonemapped result.
+	// This is the primary cause of the "metallic specular" artifact under
+	// auto-exposure, where varying exposure levels push different channels
+	// to different sigmoid positions, amplifying negative excursions.
+	val = max(val, 0.0);
+
+	// sRGB IEC 61966-2-1 2.2 Exponent Reference EOTF Display
+	// NOTE: We're linearizing the output here. Comment/adjust when
+	// *not* using a sRGB render target
+	val = pow(val, 2.2);
+	
+	return val;
+}
+
+float3 AgxLook(float3 val)
+{
+	const float3 lw = float3(0.2126, 0.7152, 0.0722);
+
+  
+	// Default
+	const float3 offset = float3(0.0, 0.0, 0.0);
+	float3 slope = float3(1.0, 1.0, 1.0);
+	float3 power = float3(1.0, 1.0, 1.0);
+	float sat = 1.0;
+ 
+#if AGX_LOOK == 1
+	// Golden
+	slope = float3(1.0, 0.9, 0.5);
+	power = float3(0.8, 0.8, 0.8);
+	sat = 0.8;
+#elif AGX_LOOK == 2
+	// Punchy
+	slope = float3(1.0, 1.0, 1.0);
+	power = float3(1.35, 1.35, 1.35);
+	sat = 1.4;
+#endif
+  
+	// ASC CDL
+	val = pow(max(val * slope + offset, 0.0), power);
+	const float luma = dot(val, lw);
+	return luma + sat * (val - luma);
+}
+
+float3 ApplyAgX(float3 ColorAP1)
+{
+	// Primary-only conversion: AP1 primaries → sRGB primaries
+    // NO chromatic adaptation (D60→D65) — avoids baking white point
+    // shift into the nonlinear AgX sigmoid
+    const float3x3 AP1_2_Linear = mul( XYZ_2_sRGB_MAT, AP1_2_XYZ_MAT );
+    const float3x3 Linear_2_AP1 = mul( XYZ_2_AP1_MAT, sRGB_2_XYZ_MAT );
+
+    float3 LinearSRGB = mul(AP1_2_Linear, ColorAP1);
+
+    LinearSRGB = Agx(LinearSRGB);
+    LinearSRGB = AgxLook(LinearSRGB);
+    LinearSRGB = AgxEotf(LinearSRGB);
+
+    return mul(Linear_2_AP1, LinearSRGB);
+}
+
+// ── Display-referred → HDR expansion (shared by AgX / Reinhard / Custom) ─────
+// These curves render the scene to a closed [0,1] display domain (no display-
+// peak parameter), so to take them into HDR we keep their SDR rendering EXACTLY
+// (preserving look / hue / contrast) and then expand the display-referred result
+// into the HDR headroom: shadows/mids below the knee stay at the SDR reference
+// (x CUSTOM_HDR_PAPER_WHITE); values above it roll smoothly up to the display
+// peak.  The expansion is driven by the peak channel and applied as a uniform
+// scale, so hue is preserved.  The knee (CUSTOM_HDR_EXPAND_KNEE) is the only
+// tunable not derived from the curve itself.  This is a display->HDR expansion
+// (it re-stretches compressed highlights), not a ground-up HDR rendering — none
+// of these curves has a canonical HDR form.
+float ShaderShift_HDR_ExpandToPeak(float v, float paperWhite, float peakNits, float knee)
+{
+	if (v <= knee)
+	{
+		return v * paperWhite;                       // SDR-identical below the knee
+	}
+	float t = saturate((v - knee) / max(1.0 - knee, 1e-4));
+	float e = t * t * (3.0 - 2.0 * t);               // smoothstep ease-in at the knee
+	return lerp(knee * paperWhite, peakNits, e);     // expand highlights to display peak
+}
+
+// Takes a display-referred [0,1] result in sRGB(Rec709) primaries and returns
+// AP1 NITS, expanding highlights to the display peak (hue-preserving).
+float3 ShaderShift_SDRDisplayToHDR_AP1nits(float3 dSRGB, float targetNits)
+{
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	dSRGB = max(dSRGB, 0.0);
+	const float paperWhite = CUSTOM_HDR_PAPER_WHITE;
+	const float peakNits   = max(targetNits, paperWhite);
+	float m     = max(dSRGB.r, max(dSRGB.g, dSRGB.b));
+	float mNits = ShaderShift_HDR_ExpandToPeak(m, paperWhite, peakNits, CUSTOM_HDR_EXPAND_KNEE);
+	float3 nitsSRGB = dSRGB * (mNits / max(m, 1e-5));
+	return mul(sRGB_2_AP1, nitsSRGB);                // AP1 nits
+}
+
+// Native HDR AgX: full SDR AgX render, then expand to the display peak.  AgX
+// uses its own primary-only AP1<->sRGB conversion (no D60->D65 CAT), so it can't
+// use the shared helper above; the expansion math is identical.
+float3 ApplyAgX_HDR_AP1nits(float3 ColorAP1, float targetNits)
+{
+	const float3x3 AP1_2_Linear = mul( XYZ_2_sRGB_MAT, AP1_2_XYZ_MAT );
+	const float3x3 Linear_2_AP1 = mul( XYZ_2_AP1_MAT, sRGB_2_XYZ_MAT );
+
+	// Full AgX render → display-linear [0,1], sRGB primaries (same as SDR path).
+	float3 d = mul(AP1_2_Linear, ColorAP1);
+	d = Agx(d);
+	d = AgxLook(d);
+	d = AgxEotf(d);
+	d = max(d, 0.0);
+
+	const float paperWhite = CUSTOM_HDR_PAPER_WHITE;
+	const float peakNits   = max(targetNits, paperWhite);
+
+	// Hue-preserving highlight expansion driven by the peak channel.
+	float m     = max(d.r, max(d.g, d.b));
+	float mNits = ShaderShift_HDR_ExpandToPeak(m, paperWhite, peakNits, CUSTOM_HDR_EXPAND_KNEE);
+	float3 nitsSRGB = d * (mNits / max(m, 1e-5));
+
+	return mul(Linear_2_AP1, nitsSRGB);              // AP1 nits
+}
+
+// Reinhard
+float3 ReinhardTonemapAP1(float3 ColorAP1)
+{
+	// Convert to sRGB for tonemapping
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	float3 LinearSRGB = mul(AP1_2_sRGB, ColorAP1);
+	
+	// Reinhard
+	LinearSRGB = LinearSRGB / (1.0f + LinearSRGB);
+	
+	// Convert back to AP1
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	return mul(sRGB_2_AP1, LinearSRGB);
+}
+
+// ACES Filmic (Narkowicz 2015 approximation) - operates in AP1 space
+float3 ACESFilmicAP1(float3 ColorAP1)
+{
+	// Convert to sRGB for tonemapping
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	float3 LinearSRGB = mul(AP1_2_sRGB, ColorAP1);
+	
+	// ACES approximation
+	const float a = 2.51f; const float b = 0.03f;
+	const float c = 2.43f; const float d = 0.59f; const float e = 0.14f;
+	LinearSRGB = saturate((LinearSRGB * (a * LinearSRGB + b)) / (LinearSRGB * (c * LinearSRGB + d) + e));
+	
+	// Convert back to AP1
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	return mul(sRGB_2_AP1, LinearSRGB);
+}
+
+float3 CustomTonemapOperator(float3 LinearColor)
+{
+	// ── Example: Uncharted 2 / Hable filmic curve ─────────────────────────────
+	// Reference: http://filmicworlds.com/blog/filmic-tonemapping-operators/
+	//
+	// Feel free to replace this with anything you like.
+
+	float3 x = LinearColor;
+
+	// Hable curve constants
+	const float A = 0.15f;  // Shoulder strength
+	const float B = 0.50f;  // Linear strength
+	const float C = 0.10f;  // Linear angle
+	const float D = 0.20f;  // Toe strength
+	const float E = 0.02f;  // Toe numerator
+	const float F = 0.30f;  // Toe denominator
+	const float W = 11.2f;  // Linear white point
+
+	// Apply the curve
+	float3 Numerator   = x * (A * x + C * B) + D * E;
+	float3 Denominator = x * (A * x + B)     + D * F;
+	float3 Mapped      = Numerator / Denominator - E / F;
+
+	// Normalise by white point
+	const float WhiteNum   = W * (A * W + C * B) + D * E;
+	const float WhiteDenom = W * (A * W + B)     + D * F;
+	const float WhiteScale = 1.0f / (WhiteNum / WhiteDenom - E / F);
+
+	return saturate(Mapped * WhiteScale);
+}
+
+// Khronos PBR Neutral tonemapper
+// Reference: https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral
+// Input/output: Linear Rec. 709 (sRGB primaries), output in [0, 1]
+float3 PBRNeutralToneMapping(float3 Color)
+{
+	const float StartCompression = 0.8 - 0.04;
+	const float Desaturation = 0.15;
+
+	float x = min(Color.r, min(Color.g, Color.b));
+	float Offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+	Color -= Offset;
+
+	float Peak = max(Color.r, max(Color.g, Color.b));
+	if (Peak < StartCompression) return Color;
+
+	const float d = 1.0 - StartCompression;
+	float NewPeak = 1.0 - d * d / (Peak + d - StartCompression);
+	Color *= NewPeak / Peak;
+
+	float g = 1.0 - 1.0 / (Desaturation * (Peak - NewPeak) + 1.0);
+	return lerp(Color, NewPeak * float3(1, 1, 1), g);
+}
+
+float3 ApplyKPBRN(float3 ColorAP1)
+{
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	float3 LinearSRGB = mul(AP1_2_sRGB, ColorAP1);
+	LinearSRGB = PBRNeutralToneMapping(LinearSRGB);
+	return mul(sRGB_2_AP1, LinearSRGB);
+}
+
+// ============================================================================
+// Gran Turismo "GT Tonemap"  [Uchimura 2017, "HDR theory and practice"]
+// Per-channel curve.  Operates in linear sRGB (Rec.709).
+// ============================================================================
+float GT_Uchimura(float x, float P, float a, float m, float l, float c, float b)
+{
+	float l0 = ((P - m) * l) / a;
+	float S0 = m + l0;
+	float S1 = m + a * l0;
+	float C2 = (a * P) / (P - S1);
+	float CP = -C2 / P;
+
+	float w0 = 1.0 - smoothstep(0.0, m, x);
+	float w2 = step(m + l0, x);
+	float w1 = 1.0 - w0 - w2;
+
+	float T = m * pow(max(x / m, 0.0), c) + b;       // toe
+	float S = P - (P - S1) * exp(CP * (x - S0));     // shoulder
+	float L = m + a * (x - m);                       // linear
+
+	return T * w0 + L * w1 + S * w2;
+}
+
+float3 ApplyGTUchimura(float3 ColorAP1)
+{
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	float3 c = max(mul(AP1_2_sRGB, ColorAP1), 0.0);
+
+	c.r = GT_Uchimura(c.r, GT_PEAK, GT_CONTRAST, GT_LINEAR_START, GT_LINEAR_LENGTH, GT_TOE_CURVE, GT_TOE_OFFSET);
+	c.g = GT_Uchimura(c.g, GT_PEAK, GT_CONTRAST, GT_LINEAR_START, GT_LINEAR_LENGTH, GT_TOE_CURVE, GT_TOE_OFFSET);
+	c.b = GT_Uchimura(c.b, GT_PEAK, GT_CONTRAST, GT_LINEAR_START, GT_LINEAR_LENGTH, GT_TOE_CURVE, GT_TOE_OFFSET);
+
+	return mul(sRGB_2_AP1, c);
+}
+
+// ============================================================================
+// Gran Turismo 7 Tone Mapping  [Polyphony Digital, SIGGRAPH 2025, MIT License]
+// Faithful SDR port of the official reference (gt7_tone_mapping.cpp): a
+// "color volume mapping" operator that blends a per-channel curve with a
+// chroma-scaled version computed in the ICtCp uniform color space (perceptual,
+// hue-preserving).  Operates in linear Rec.2020 frame-buffer values where
+// 1.0 == REFERENCE_LUMINANCE (100 cd/m^2).  SDR config: paper white 250 nits
+// => framebuffer target 2.5, sdrCorrection 0.4 => output in [0,1].
+// ============================================================================
+#define GT7_REF_LUM    100.0
+#define GT7_SDR_WHITE  250.0
+
+float GT7_smoothStep(float x, float e0, float e1)
+{
+	float t = saturate((x - e0) / (e1 - e0));
+	return t * t * (3.0 - 2.0 * t);
+}
+
+// ST-2084 (PQ) EOTF / inverse, scaled to frame-buffer luminance units.
+float GT7_eotfPQ(float n)
+{
+	n = saturate(n);
+	const float m1 = 0.1593017578125, m2 = 78.84375;
+	const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875, pqC = 10000.0;
+	float np = pow(n, 1.0 / m2);
+	float l  = max(np - c1, 0.0) / (c2 - c3 * np);
+	l = pow(l, 1.0 / m1);
+	return (l * pqC) / GT7_REF_LUM;
+}
+float GT7_invEotfPQ(float v)
+{
+	const float m1 = 0.1593017578125, m2 = 78.84375;
+	const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875, pqC = 10000.0;
+	float y  = max((v * GT7_REF_LUM) / pqC, 0.0);
+	float ym = pow(y, m1);
+	return exp2(m2 * (log2(c1 + c2 * ym) - log2(1.0 + c3 * ym)));
+}
+
+float3 GT7_rgbToICtCp(float3 rgb)   // rgb: linear Rec.2020
+{
+	float l = (rgb.r * 1688.0 + rgb.g * 2146.0 + rgb.b * 262.0) / 4096.0;
+	float m = (rgb.r * 683.0  + rgb.g * 2951.0 + rgb.b * 462.0) / 4096.0;
+	float s = (rgb.r * 99.0   + rgb.g * 309.0  + rgb.b * 3688.0) / 4096.0;
+	float lPQ = GT7_invEotfPQ(l), mPQ = GT7_invEotfPQ(m), sPQ = GT7_invEotfPQ(s);
+	return float3(
+		(2048.0 * lPQ + 2048.0 * mPQ) / 4096.0,
+		(6610.0 * lPQ - 13613.0 * mPQ + 7003.0 * sPQ) / 4096.0,
+		(17933.0 * lPQ - 17390.0 * mPQ - 543.0 * sPQ) / 4096.0);
+}
+float3 GT7_iCtCpToRgb(float3 ictcp)
+{
+	float l = ictcp.x + 0.00860904 * ictcp.y + 0.11103  * ictcp.z;
+	float m = ictcp.x - 0.00860904 * ictcp.y - 0.11103  * ictcp.z;
+	float s = ictcp.x + 0.560031   * ictcp.y - 0.320627 * ictcp.z;
+	float lLin = GT7_eotfPQ(l), mLin = GT7_eotfPQ(m), sLin = GT7_eotfPQ(s);
+	return float3(
+		max( 3.43661   * lLin - 2.50645   * mLin + 0.0698454 * sLin, 0.0),
+		max(-0.79133   * lLin + 1.9836    * mLin - 0.192271  * sLin, 0.0),
+		max(-0.0259499 * lLin - 0.0989137 * mLin + 1.12486   * sLin, 0.0));
+}
+
+// GT tone-mapping curve V2 (convergent shoulder), evaluated per channel.
+// `peak` = framebufferLuminanceTarget_ (display target nits / 100).  SDR uses
+// 2.5 (250-nit paper white); HDR uses displayPeakNits/100 (e.g. 10 for 1000).
+float GT7_curve(float x, float peak)
+{
+	const float alpha = 0.25, mid = 0.538, lin = 0.444, toe = 1.280;
+	float k  = (lin - 1.0) / (alpha - 1.0);
+	float kA = peak * lin + peak * k;
+	float kB = -peak * k * exp(lin / k);
+	float kC = -1.0 / (k * peak);
+
+	if (x < 0.0) return 0.0;
+	float wLin = GT7_smoothStep(x, 0.0, mid);
+	float wToe = 1.0 - wLin;
+	if (x < lin * peak)
+	{
+		float toeMapped = mid * pow(x / mid, toe);
+		return wToe * toeMapped + wLin * x;
+	}
+	return kA + kB * exp(x * kC);   // shoulder
+}
+
+// Generalized GT7 operator.  `peak` = framebufferLuminanceTarget_, `sdrCorrection`
+// = 1.0 in HDR or 1/peak in SDR (maps the 250-nit-referenced curve back to [0,1]).
+float3 GT7ToneMap_Rec2020(float3 rgb, float peak, float sdrCorrection)   // rgb: linear Rec.2020 frame-buffer values
+{
+	const float blendRatio = 0.6, fadeStart = 0.98, fadeEnd = 1.16;
+
+	float lumTargetUcs = GT7_rgbToICtCp(float3(peak, peak, peak)).x;
+
+	float3 ucs       = GT7_rgbToICtCp(rgb);
+	float3 skewedRgb = float3(GT7_curve(rgb.r, peak), GT7_curve(rgb.g, peak), GT7_curve(rgb.b, peak));
+	float3 skewedUcs = GT7_rgbToICtCp(skewedRgb);
+
+	float chromaScale = 1.0 - GT7_smoothStep(ucs.x / lumTargetUcs, fadeStart, fadeEnd);
+	float3 scaledUcs  = float3(skewedUcs.x, ucs.y * chromaScale, ucs.z * chromaScale);
+	float3 scaledRgb  = GT7_iCtCpToRgb(scaledUcs);
+
+	float3 blended = (1.0 - blendRatio) * skewedRgb + blendRatio * scaledRgb;
+	return sdrCorrection * min(blended, float3(peak, peak, peak));
+}
+
+// AP1 (ACEScg, D60) <-> linear Rec.2020 (D65) gamut conversions for GT7.
+float3 GT7_AP1ToRec2020(float3 ColorAP1)
+{
+	const float3x3 XYZ_2_Rec2020 = float3x3(
+		 1.7166512, -0.3556708, -0.2533663,
+		-0.6666844,  1.6164812,  0.0157685,
+		 0.0176399, -0.0427706,  0.9421031);
+	const float3x3 AP1_2_Rec2020 = mul( XYZ_2_Rec2020, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	return mul( AP1_2_Rec2020, ColorAP1 );
+}
+float3 GT7_Rec2020ToAP1(float3 Rec2020)
+{
+	const float3x3 Rec2020_2_XYZ = float3x3(
+		0.6369580, 0.1446169, 0.1688810,
+		0.2627002, 0.6779981, 0.0593017,
+		0.0000000, 0.0280727, 1.0609851);
+	const float3x3 Rec2020_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, Rec2020_2_XYZ ) );
+	return mul( Rec2020_2_AP1, Rec2020 );
+}
+
+// SDR: 250-nit paper white, output AP1 in [0,1].
+float3 ApplyGT7(float3 ColorAP1)
+{
+	const float peak = GT7_SDR_WHITE / GT7_REF_LUM;        // 2.5
+	float3 rec2020 = max(GT7_AP1ToRec2020(ColorAP1), 0.0);
+	float3 tm = GT7ToneMap_Rec2020(rec2020, peak, 1.0 / peak);
+	return GT7_Rec2020ToAP1(tm);
+}
+
+// HDR: target = display peak nits (GT7 lower bound 250); output = AP1 NITS,
+// using the full display range with the GT7 highlight roll-off.
+float3 ApplyGT7_HDR_AP1nits(float3 ColorAP1, float targetNits)
+{
+	float peak = max(targetNits, GT7_SDR_WHITE) / GT7_REF_LUM;   // framebufferLuminanceTarget_
+	float3 rec2020 = max(GT7_AP1ToRec2020(ColorAP1), 0.0);
+	float3 fb = GT7ToneMap_Rec2020(rec2020, peak, 1.0);          // [0, peak] frame-buffer values
+	return GT7_Rec2020ToAP1(fb) * GT7_REF_LUM;                   // AP1 nits (fb * 100)
+}
+
+// GT Tonemap (Uchimura) HDR: its peak P is built for variable display luminance.
+// Toe/mid/linear params stay fixed (same shape SDR<->HDR); P = display peak.
+// Output = AP1 NITS.
+float3 ApplyGTUchimura_HDR_AP1nits(float3 ColorAP1, float targetNits)
+{
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	float3 c = max(mul(AP1_2_sRGB, ColorAP1), 0.0);
+	float P = max(targetNits, 1.0) / GT7_REF_LUM;   // peak in frame-buffer units
+
+	c.r = GT_Uchimura(c.r, P, GT_CONTRAST, GT_LINEAR_START, GT_LINEAR_LENGTH, GT_TOE_CURVE, GT_TOE_OFFSET);
+	c.g = GT_Uchimura(c.g, P, GT_CONTRAST, GT_LINEAR_START, GT_LINEAR_LENGTH, GT_TOE_CURVE, GT_TOE_OFFSET);
+	c.b = GT_Uchimura(c.b, P, GT_CONTRAST, GT_LINEAR_START, GT_LINEAR_LENGTH, GT_TOE_CURVE, GT_TOE_OFFSET);
+
+	return mul(sRGB_2_AP1, c) * GT7_REF_LUM;        // AP1 nits ([0,P] * 100)
+}
+
+// Reinhard HDR: SDR Reinhard render, then expand highlights to the display peak.
+float3 ApplyReinhard_HDR_AP1nits(float3 ColorAP1, float targetNits)
+{
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	float3 c = max(mul(AP1_2_sRGB, ColorAP1), 0.0);
+	float3 d = c / (1.0 + c);                          // SDR Reinhard display [0,1)
+	return ShaderShift_SDRDisplayToHDR_AP1nits(d, targetNits);
+}
+
+// Custom/Hable HDR: SDR Hable render, then expand highlights to the display peak.
+float3 ApplyCustom_HDR_AP1nits(float3 ColorAP1, float targetNits)
+{
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	float3 c = max(mul(AP1_2_sRGB, ColorAP1), 0.0);
+	float3 d = CustomTonemapOperator(c);               // SDR Hable display [0,1]
+	return ShaderShift_SDRDisplayToHDR_AP1nits(d, targetNits);
+}
+
+// Linear HDR: no tone curve.  Scene-linear scaled so 1.0 = paper white, then
+// allowed to extend up to the display peak (clamped).  True linear-HDR passthrough.
+float3 ApplyLinear_HDR_AP1nits(float3 ColorAP1, float targetNits)
+{
+	const float peakNits = max(targetNits, CUSTOM_HDR_PAPER_WHITE);
+	float3 nitsAP1 = max(ColorAP1, 0.0) * CUSTOM_HDR_PAPER_WHITE;
+	return min(nitsAP1, float3(peakNits, peakNits, peakNits));
+}
+
+// ============================================================================
+// Apex  (ShaderShift) — AgX chroma handling around a display-peak GT tonescale.
+// peakFB = display peak in frame-buffer units (SDR: 1.0; HDR: displayPeak/100).
+// Returns AP1 in frame-buffer-linear units (0..peakFB).
+// ============================================================================
+float3 ApplyApex_FB(float3 ColorAP1, float peakFB)
+{
+	const float3x3 AP1_2_Linear = mul( XYZ_2_sRGB_MAT, AP1_2_XYZ_MAT );
+	const float3x3 Linear_2_AP1 = mul( XYZ_2_AP1_MAT, sRGB_2_XYZ_MAT );
+
+	// AgX inset / outset matrices (Missing Deadlines minimal AgX).
+	const float3x3 agx_inset = float3x3(
+		0.842479062253094,  0.0423282422610123, 0.0423756549057051,
+		0.0784335999999992, 0.878468636469772,  0.0784336,
+		0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+	const float3x3 agx_outset = float3x3(
+		 1.19687900512017,  -0.0528968517574562, -0.0529716355144438,
+		-0.0980208811401368, 1.15190312990417,   -0.0980434501171241,
+		-0.0990297440797205,-0.0989611768448433,  1.15107367264116);
+	const float3x3 I3 = float3x3(1,0,0, 0,1,0, 0,0,1);
+
+	float3 c = max(mul(AP1_2_Linear, ColorAP1), 0.0);
+
+	// Controllable AgX inset (pre-curve chroma attenuation → hue stability).
+	float3x3 inset = lerp(I3, agx_inset, APEX_INSET);
+	c = max(mul(c, inset), 0.0);
+
+	// HDR-native tonescale: Uchimura GT curve to the display peak (toe/linear
+	// fixed, peak = peakFB) — same curve GT mode 5 uses.
+	c.r = GT_Uchimura(c.r, peakFB, APEX_CONTRAST, APEX_LINEAR_START, APEX_LINEAR_LENGTH, APEX_TOE, APEX_TOE_OFFSET);
+	c.g = GT_Uchimura(c.g, peakFB, APEX_CONTRAST, APEX_LINEAR_START, APEX_LINEAR_LENGTH, APEX_TOE, APEX_TOE_OFFSET);
+	c.b = GT_Uchimura(c.b, peakFB, APEX_CONTRAST, APEX_LINEAR_START, APEX_LINEAR_LENGTH, APEX_TOE, APEX_TOE_OFFSET);
+
+	// Outset (post-curve re-saturation) operates on normalized [0,1]; rescale.
+	float3x3 outset = lerp(I3, agx_outset, APEX_INSET);
+	float3 cn = c / max(peakFB, 1e-4);
+	cn = max(mul(cn, outset), 0.0);
+	c = cn * peakFB;
+
+	// Look: saturation.
+	float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+	c = max(luma + APEX_SAT * (c - luma), 0.0);
+
+	return mul(Linear_2_AP1, c);
+}
+
+// ============================================================================
+// Prism  (ShaderShift original) — hue-preserving luminance tonescale + minimal
+// fit-to-peak highlight desaturation, in Rec.2020.  peakFB as above.
+// Returns AP1 in frame-buffer-linear units (0..peakFB).
+// ============================================================================
+float3 ApplyPrism_FB(float3 ColorAP1, float peakFB)
+{
+	float3 c = max(GT7_AP1ToRec2020(ColorAP1), 0.0);
+
+	const float3 Yw = float3(0.2627, 0.6780, 0.0593);    // Rec.2020 luma weights (sum = 1)
+	float L = max(dot(c, Yw), 1e-6);
+
+	// Luminance tonescale: f(L) = P * L^a / (L^a + k), anchored so mid-gray
+	// (PRISM_MID_IN) → PRISM_MID_OUT and the curve asymptotes to the peak P.
+	float a  = PRISM_CONTRAST;
+	float La = pow(L, a);
+	float k  = pow(PRISM_MID_IN, a) * (peakFB / max(PRISM_MID_OUT, 1e-4) - 1.0);
+	float Ld = peakFB * La / max(La + k, 1e-6);          // [0, peakFB)
+
+	// Chroma/hue-preserving reconstruction (pure luminance ratio).
+	float3 cd = c * (Ld / L);
+
+	// Minimal "fit-to-peak" desaturation: blend toward the neutral of the SAME
+	// luminance (preserves luma & hue angle) just enough to bring the brightest
+	// channel to the peak.  PRISM_DESAT scales it (1 = no clip; <1 = let it clip
+	// a little for extra vividness).
+	float mx      = max(cd.r, max(cd.g, cd.b));
+	float tNeeded = (mx > peakFB) ? saturate((mx - peakFB) / max(mx - Ld, 1e-4)) : 0.0;
+	cd = lerp(cd, float3(Ld, Ld, Ld), tNeeded * PRISM_DESAT);
+
+	return GT7_Rec2020ToAP1(cd);
+}
+
+// Dispatch for HDR output: returns AP1 NITS for the active custom tonemapper.
+// With CUSTOM_HDR_NATIVE, every custom tonemapper uses the display's HDR range
+// (target = maxLum = OutputMaxLuminance): GT7/GT/Uchimura via their display-peak
+// parameter; AgX/Reinhard/Custom via SDR-render-then-highlight-expansion; Linear
+// as a clamped passthrough.  With CUSTOM_HDR_NATIVE 0 (or mode 0), it falls back
+// to SDR-parity (FilmColorAP1 mapped so 1.0 = CUSTOM_HDR_PAPER_WHITE nits).
+float3 ShaderShift_HDR_ODTNits(float3 GradedColorAP1, float3 FilmColorAP1, float maxLum)
+{
+#if CUSTOM_HDR_NATIVE
+	#if   (CUSTOM_TONEMAP_MODE == 6)
+		return ApplyGT7_HDR_AP1nits(GradedColorAP1, maxLum);
+	#elif (CUSTOM_TONEMAP_MODE == 5)
+		return ApplyGTUchimura_HDR_AP1nits(GradedColorAP1, maxLum);
+	#elif (CUSTOM_TONEMAP_MODE == 1)
+		return ApplyAgX_HDR_AP1nits(GradedColorAP1, maxLum);
+	#elif (CUSTOM_TONEMAP_MODE == 2)
+		return ApplyReinhard_HDR_AP1nits(GradedColorAP1, maxLum);
+	#elif (CUSTOM_TONEMAP_MODE == 3)
+		return ApplyLinear_HDR_AP1nits(GradedColorAP1, maxLum);
+	#elif (CUSTOM_TONEMAP_MODE == 4)
+		return ApplyCustom_HDR_AP1nits(GradedColorAP1, maxLum);
+	#elif (CUSTOM_TONEMAP_MODE == 7)
+		return ApplyApex_FB(GradedColorAP1, max(maxLum, CUSTOM_HDR_PAPER_WHITE) / CUSTOM_HDR_PAPER_WHITE) * CUSTOM_HDR_PAPER_WHITE;
+	#elif (CUSTOM_TONEMAP_MODE == 8)
+		return ApplyPrism_FB(GradedColorAP1, max(maxLum, CUSTOM_HDR_PAPER_WHITE) / CUSTOM_HDR_PAPER_WHITE) * CUSTOM_HDR_PAPER_WHITE;
+	#else
+		return FilmColorAP1 * CUSTOM_HDR_PAPER_WHITE;   // SDR-parity
+	#endif
+#else
+	return FilmColorAP1 * CUSTOM_HDR_PAPER_WHITE;       // forced SDR-parity
+#endif
+}
+
+// Custom tonemap dispatcher - replaces FilmToneMap()
+float3 CustomFilmToneMap(float3 ColorAP1)
+{
+	#if CUSTOM_TONEMAP_MODE == 1
+		// AgX
+		return ApplyAgX(ColorAP1);
+	#elif CUSTOM_TONEMAP_MODE == 2
+		// Reinhard
+		return ReinhardTonemapAP1(ColorAP1);
+	#elif CUSTOM_TONEMAP_MODE == 3
+		// Linear (no tonemapping)
+		return saturate(ColorAP1);
+	//#elif CUSTOM_TONEMAP_MODE == 4
+		// Khronos PBR Neutral
+	//	return ApplyKPBRN(ColorAP1);
+	#elif CUSTOM_TONEMAP_MODE == 4
+		// Custom (user-defined below in CustomTonemapOperator)
+		const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+		float3 LinearSRGB = mul(AP1_2_sRGB, ColorAP1);
+		LinearSRGB = CustomTonemapOperator(LinearSRGB);
+		// Convert back to AP1
+		const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+		return mul(sRGB_2_AP1, LinearSRGB);
+	#elif CUSTOM_TONEMAP_MODE == 5
+		// Gran Turismo "GT Tonemap" (Uchimura 2017)
+		return ApplyGTUchimura(ColorAP1);
+	#elif CUSTOM_TONEMAP_MODE == 6
+		// Gran Turismo 7 (2025) physically-based / perceptual tonemap
+		return ApplyGT7(ColorAP1);
+	#elif CUSTOM_TONEMAP_MODE == 7
+		// Apex (ShaderShift): AgX chroma handling + GT display-peak tonescale
+		return ApplyApex_FB(ColorAP1, 1.0);
+	#elif CUSTOM_TONEMAP_MODE == 8
+		// Prism (ShaderShift original): hue-preserving luminance + fit-to-peak desat
+		return ApplyPrism_FB(ColorAP1, 1.0);
+	#else
+		// Mode 0: Use engine's FilmToneMap (ACES Academy Color) as default
+		return FilmToneMap(ColorAP1);
+	#endif
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+float4 CombineLUTsCommon(float2 InUV, uint InLayerIndex)
+{
+#if USE_VOLUME_LUT == 1
+	// construct the neutral color from a 3d position volume texture	
+	float4 Neutral;
+	{
+		float2 UV = InUV - float2(0.5f / LUTSize, 0.5f / LUTSize);
+
+		Neutral = float4(UV * LUTSize / (LUTSize - 1), InLayerIndex / (LUTSize - 1), 0);
+	}
+#else
+	// construct the neutral color from a 2d position in 256x16
+	float4 Neutral;
+	{ 
+		float2 UV = InUV;
+
+		// 0.49999f instead of 0.5f to avoid getting into negative values
+		UV -= float2(0.49999f / (LUTSize * LUTSize), 0.49999f / LUTSize);
+
+		float Scale = LUTSize / (LUTSize - 1);
+
+		float3 RGB;
+		
+		RGB.r = frac(UV.x * LUTSize);
+		RGB.b = UV.x - RGB.r / LUTSize;
+		RGB.g = UV.y;
+
+		Neutral = float4(RGB * Scale, 0);
+	}
+#endif
+
+	float4 OutColor = 0;
+	
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	const float3x3 AP0_2_AP1 = mul( XYZ_2_AP1_MAT, AP0_2_XYZ_MAT );
+	const float3x3 AP1_2_AP0 = mul( XYZ_2_AP0_MAT, AP1_2_XYZ_MAT );
+
+	const float3x3 AP1_2_Output  = OuputGamutMappingMatrix( OutputGamut );
+
+	float3 LUTEncodedColor = Neutral.rgb;
+	float3 LinearColor;
+	// Decode texture values as ST-2084 (Dolby PQ)
+	BRANCH
+	if (GetOutputDevice() >= TONEMAPPER_OUTPUT_ACES1000nitST2084)
+	{
+		// Since ST2084 returns linear values in nits, divide by a scale factor to convert
+		// the reference nit result to be 1.0 in linear.
+		// (for efficiency multiply by precomputed inverse)
+		LinearColor = ST2084ToLinear(LUTEncodedColor) * LinearToNitsScaleInverse;
+	}
+	// Decode log values
+	else
+	{
+		LinearColor = LogToLin(LUTEncodedColor) - LogToLin(0);
+	}
+
+	float3 BalancedColor = LinearColor;
+	
+	BRANCH
+	if( abs(WhiteTemp - DefaultTemperature) > Epsilon || abs(WhiteTint - DefaultTint) > Epsilon )
+	{
+		BalancedColor = WhiteBalance(LinearColor, WhiteTemp, WhiteTint, bIsTemperatureWhiteBalance, (float3x3)WorkingColorSpace.ToXYZ, (float3x3)WorkingColorSpace.FromXYZ);
+	}
+
+	float3 ColorAP1 = mul( (float3x3)WorkingColorSpace.ToAP1, BalancedColor );
+
+#if CUSTOM_TONEMAP_MODE == 0
+	// Expand bright saturated colors outside the sRGB gamut to fake wide gamut rendering.
+	// ACES-specific: bypassed for all other tonemappers.
+ 	float  LumaAP1 = dot( ColorAP1, AP1_RGB2Y );
+	float3 ChromaAP1 = ColorAP1 / LumaAP1;
+
+	float ChromaDistSqr = dot( ChromaAP1 - 1, ChromaAP1 - 1 );
+	float ExpandAmount = ( 1 - exp2( -4 * ChromaDistSqr ) ) * ( 1 - exp2( -4 * ExpandGamut * LumaAP1*LumaAP1 ) );
+
+	// Bizarre matrix but this expands sRGB to between P3 and AP1
+	// CIE 1931 chromaticities:	x		y
+	//				Red:		0.6965	0.3065
+	//				Green:		0.245	0.718
+	//				Blue:		0.1302	0.0456
+	//				White:		0.3127	0.329
+	const float3x3 Wide_2_XYZ_MAT =
+	{
+		0.5441691,  0.2395926,  0.1666943,
+		0.2394656,  0.7021530,  0.0583814,
+		-0.0023439,  0.0361834,  1.0552183,
+	};
+
+	const float3x3 Wide_2_AP1 = mul( XYZ_2_AP1_MAT, Wide_2_XYZ_MAT );
+	const float3x3 ExpandMat = mul( Wide_2_AP1, AP1_2_sRGB );
+
+	float3 ColorExpand = mul( ExpandMat, ColorAP1 );
+	ColorAP1 = lerp( ColorAP1, ColorExpand, ExpandAmount );
+#endif // CUSTOM_TONEMAP_MODE == 0
+
+	ColorAP1 = ColorCorrectAll( ColorAP1 );
+
+	// Store for Linear HDR output without tone curve
+	float3 GradedColor = mul( (float3x3)WorkingColorSpace.FromAP1, ColorAP1 );
+
+#if CUSTOM_TONEMAP_MODE == 0
+	// Blue correction for ACES: corrects ACES's tendency to desaturate blues.
+	// Bypassed for all other tonemappers — the forward+inverse pair doesn't cancel
+	// cleanly through a nonlinear tonemapper, leaving a residual color shift.
+	const float3x3 BlueCorrect =
+	{
+		0.9404372683, -0.0183068787, 0.0778696104,
+		0.0083786969,  0.8286599939, 0.1629613092,
+		0.0005471261, -0.0008833746, 1.0003362486
+	};
+	const float3x3 BlueCorrectInv =
+	{
+		1.06318,     0.0233956, -0.0865726,
+		-0.0106337,   1.20632,   -0.19569,
+		-0.000590887, 0.00105248, 0.999538
+	};
+	const float3x3 BlueCorrectAP1    = mul( AP0_2_AP1, mul( BlueCorrect,    AP1_2_AP0 ) );
+	const float3x3 BlueCorrectInvAP1 = mul( AP0_2_AP1, mul( BlueCorrectInv, AP1_2_AP0 ) );
+
+	// Blue correction
+	ColorAP1 = lerp( ColorAP1, mul( BlueCorrectAP1, ColorAP1 ), BlueCorrection );
+#endif // CUSTOM_TONEMAP_MODE == 0
+
+	// ── PLUGIN OVERRIDE: stash pre-tonemap colour in working space ──────────
+	// Used by the post-FilmColor hue-preservation pass below.  Moving the
+	// correction past the engine's own AP1→working conversion eliminates
+	// the AP1 round-trip that earlier versions of this code went through
+	// (working → AP1 → tonemap → my correction in AP1 → AP1 → working);
+	// any small precision drift in the ToAP1 / FromAP1 matrix pair compounded
+	// across two trips and showed up as a hue shift on saturated highlights.
+#if CUSTOM_BLOOM_PRESERVE_COLOR
+	float3 ShaderShift_OriginalWorkingColor =
+		mul((float3x3)WorkingColorSpace.FromAP1, ColorAP1);
+#endif
+
+	// ── PLUGIN OVERRIDE: Custom tonemapping replaces FilmToneMap ────────────
+	// Tonemapped color in the AP1 gamut
+	float3 ToneMappedColorAP1 = CustomFilmToneMap( ColorAP1 );
+
+	ColorAP1 = lerp(ColorAP1, ToneMappedColorAP1, ToneCurveAmount);
+
+#if CUSTOM_TONEMAP_MODE == 0
+	// Uncorrect blue to maintain white point
+	ColorAP1 = lerp( ColorAP1, mul( BlueCorrectInvAP1, ColorAP1 ), BlueCorrection );
+#endif // CUSTOM_TONEMAP_MODE == 0
+
+	// Convert from AP1 to the working color space and clip out-of-gamut values
+	float3 FilmColor = max(0, mul( (float3x3)WorkingColorSpace.FromAP1, ColorAP1 ));
+
+	// ── PLUGIN OVERRIDE: hue-preserving highlight correction ────────────────
+	//
+	// Per-channel tonemappers (ACES, AgX, …) compress each channel
+	// independently, which desaturates bright HDR pixels — an emissive at
+	// e.g. (0, 200, 0) tonemaps to a near-white FilmColor instead of the
+	// pure green the user expects.  Pre-4.17 Unreal used a luminance-based
+	// curve that compressed brightness uniformly while preserving chroma;
+	// we approximate that look by replacing FilmColor (at high luminance)
+	// with the original HDR colour scaled down to the engine's tonemapped
+	// luminance, then soft-clamped so the dominant channel hits 1.0.
+	//
+	// Applied here, in working space, AFTER the engine's own AP1→working
+	// conversion — earlier versions did the math in AP1 and round-tripped
+	// back, which compounded matrix precision errors and produced a
+	// yellow-shifted core on saturated highlights.  At this point both
+	// FilmColor and ShaderShift_OriginalWorkingColor are in the same
+	// (working-space) coordinate system, so the math is exact and the
+	// preserved hue lands clean.
+	//
+	// Down ramp: hands back to the engine default at extreme HDR
+	// (OrigLum ≳ 540) so the very brightest pixels trend cleanly to
+	// white instead of staying saturated.  No up-ramp — earlier versions
+	// gated the fade-in on TmLum, but per-channel ACES/AgX saturates
+	// TmLum to ~1.0 so quickly that the entire transition collapsed into
+	// a few-pixel-wide window and read as a hard edge.  Always-on with
+	// just the high-HDR fallback gives a smooth gradient.
+#if CUSTOM_BLOOM_PRESERVE_COLOR
+	{
+		const float3 LumWeights = float3(0.2126, 0.7152, 0.0722);
+		float OrigLum = max(dot(ShaderShift_OriginalWorkingColor, LumWeights), 1e-4);
+		float TmLum   = max(dot(FilmColor, LumWeights), 1e-4);
+
+		// Uniform luminance scale — preserves hue exactly.
+		float3 HueScaled = ShaderShift_OriginalWorkingColor * (TmLum / OrigLum);
+
+		// Saturation amplification — push off-channels toward zero so
+		// slight cross-channel content (indirect lighting, bloom, AgX
+		// channel coupling, LUT cell interpolation) doesn't bleed into
+		// the result.  Lerping from luminance with factor > 1 pushes
+		// off-channels into negatives; max(0,..) clamps them.  Neutral
+		// inputs (greys) pass through unchanged because the deltas from
+		// luminance are zero.
+		const float SatBoost = 2.0;
+		float HueLum = dot(HueScaled, LumWeights);
+		HueScaled = max(0.0, lerp(HueLum.xxx, HueScaled, SatBoost));
+
+		// Soft-clamp the dominant channel back to ≤ 1.0.
+		float MaxChan = max(HueScaled.r, max(HueScaled.g, HueScaled.b));
+		HueScaled /= max(MaxChan, 1.0);
+
+		// Up ramp: gate the correction by brightness so it only affects
+		// pixels that are actually emissive-bright.  Without this gate,
+		// every chromatic LUT cell (lemons, bread, fabric, anything with
+		// any warm or cool cast at all) gets the saturation boost
+		// applied, which pushes the entire scene into oversaturated
+		// territory.  Gating on OrigLum lets us excise normal-scene
+		// content from the correction while still hitting bright
+		// emissive cores at full strength.
+		//
+		// OrigLum (rather than TmLum) is the right signal here because
+		// TmLum saturates to ~1 the moment a pixel gets even modestly
+		// bright — its transition zone collapses to a few pixels in
+		// screen space and reads as a hard ring.  OrigLum varies
+		// linearly with HDR input across the LUT range, so a
+		// smoothstep on it gives a wide, gradual transition both in
+		// LUT cell space and (consequently) in screen space.
+		//
+		// (5, 11) thresholds: cells with OrigLum below ~5 (≈ scene
+		// HDR < 7) get no correction; cells at OrigLum ≳ 11 (the
+		// SDR LUT corner) get full correction; smooth gradient in
+		// between.  Tune the start threshold up to exclude more of
+		// the scene from the effect, down to include sun-lit highlights.
+		float Up = smoothstep(5.0, 11.0, OrigLum);
+
+		// Down ramp kept for HDR-output safety — won't trigger in SDR
+		// because LUT cells max at OrigLum ≈ 11.  In HDR LUT modes
+		// where cells extend past 150, this fades the correction back
+		// to engine default for the white-core fallback.
+		float Down = smoothstep(150.0, 540.0, OrigLum);
+
+		float HighlightBlend = Up * (1.0 - Down);
+
+		FilmColor = lerp(FilmColor, HueScaled, HighlightBlend);
+	}
+#endif
+	// ────────────────────────────────────────────────────────────────────────
+
+#if BLENDCOUNT > 1
+	{
+		// Legacy LDR LUT color grading
+
+		// FIXME 
+		// LUTs are in sRGB transfer function space
+		// LUTs applied in sRGB gamut as well
+		half3 GammaColor = LinearToSrgb( saturate( FilmColor ) );
+
+		float3 UVW = GammaColor * (15.0 / 16.0) + (0.5f / 16.0);
+
+		GammaColor = GET_SCALAR_ARRAY_ELEMENT(LUTWeights, 0) * GammaColor;
+
+		// BLENDCOUNT is the number of LUT that are blended together including the neutral one
+	#if BLENDCOUNT >= 2
+		GammaColor += GET_SCALAR_ARRAY_ELEMENT(LUTWeights, 1) * UnwrappedTexture3DSample( Textures_1, Samplers_1, UVW, 16, 1 / 16.0 ).rgb;
+	#endif
+
+	#if BLENDCOUNT >= 3
+		GammaColor += GET_SCALAR_ARRAY_ELEMENT(LUTWeights, 2) * UnwrappedTexture3DSample( Textures_2, Samplers_2, UVW, 16, 1 / 16.0 ).rgb;
+	#endif
+
+	#if BLENDCOUNT >= 4
+		GammaColor += GET_SCALAR_ARRAY_ELEMENT(LUTWeights, 3) * UnwrappedTexture3DSample( Textures_3, Samplers_3, UVW, 16, 1 / 16.0 ).rgb;
+	#endif
+
+	#if BLENDCOUNT >= 5
+		GammaColor += GET_SCALAR_ARRAY_ELEMENT(LUTWeights, 4) * UnwrappedTexture3DSample( Textures_4, Samplers_4, UVW, 16, 1 / 16.0 ).rgb;
+	#endif
+
+		// Back to linear space, AP1 gamut
+		FilmColor =  sRGBToLinear( GammaColor );
+	}
+#endif
+	
+	// apply math color correction on top to texture based solution
+	FilmColor = ColorCorrection( FilmColor );
+
+	// blend with custom LDR color, used for Fade track in Cinematics
+	float3 FilmColorNoGamma = lerp( FilmColor * ColorScale, OverlayColor.rgb, OverlayColor.a );
+	// Apply Fade track to linear outputs also
+	GradedColor = lerp(GradedColor * ColorScale, OverlayColor.rgb, OverlayColor.a);
+
+
+	// Apply "gamma" curve adjustment.
+	FilmColor = pow( max(0, FilmColorNoGamma), InverseGamma.y );
+		
+	// Note: Any changes to the following device encoding logic must also be made 
+	// in PostProcessDeviceEncodingOnly.usf's corresponding pixel shader.
+	half3 OutDeviceColor = 0;
+	BRANCH
+
+	// sRGB, user specified gamut
+	if( GetOutputDevice() == TONEMAPPER_OUTPUT_sRGB)
+	{		
+		// Convert from sRGB to specified output gamut	
+		//float3 OutputGamutColor = mul( AP1_2_Output, mul( sRGB_2_AP1, FilmColor ) );
+
+		// FIXME: Workaround for UE-29935, pushing all colors with a 0 component to black output
+		// Default parameters seem to cancel out (sRGB->XYZ->AP1->XYZ->sRGB), so should be okay for a temp fix
+		float3 OutputGamutColor = WorkingColorSpace.bIsSRGB ? FilmColor : mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
+
+		// Apply conversion to sRGB (this must be an exact sRGB conversion else darks are bad).
+		OutDeviceColor = LinearToSrgb( OutputGamutColor );
+	}
+
+	// Rec 709, user specified gamut
+	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_Rec709)
+	{
+		// Convert from the working color space to specified output gamut
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
+
+		// Didn't profile yet if the branching version would be faster (different linear segment).
+		OutDeviceColor = LinearTo709Branchless( OutputGamutColor );
+	}
+
+	// ACES transform with PQ/2084 encoding, user specified gamut
+	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_ACES1000nitST2084 || GetOutputDevice() == TONEMAPPER_OUTPUT_ACES2000nitST2084)
+	{
+#if (CUSTOM_TONEMAP_MODE != 0) && CUSTOM_HDR_PARITY
+		// PLUGIN HDR: route the custom tonemapper to the PQ signal instead of the
+		// engine ACES ODT.  GT/GT7 (CUSTOM_HDR_NATIVE) tone-map to the display
+		// peak (OutputMaxLuminance) and use the full HDR range; other modes use
+		// SDR-parity (FilmColor at CUSTOM_HDR_PAPER_WHITE nits).
+		float3 GradedColorAP1 = mul( (float3x3)WorkingColorSpace.ToAP1, GradedColor );
+		float3 FilmColorAP1   = mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor );
+		float3 OdtNitsAP1 = ShaderShift_HDR_ODTNits( GradedColorAP1, FilmColorAP1, OutputMaxLuminance );
+		OutDeviceColor = LinearToST2084( mul( AP1_2_Output, OdtNitsAP1 ) );
+#else
+#if USE_ACES_2
+		float3 ODTColor = ACESOutputTransform(GradedColor * ACESSceneColorMultiplier, (float3x3) WorkingColorSpace.ToAP0, OutputMaxLuminance, ACESReachTable, ACESGamutTable, ACESGammaTable);
+#else
+		FACESTonemapParams AcesParams = ComputeACESTonemapParams(ACESMinMaxData, ACESMidData, ACESCoefsLow_0, ACESCoefsHigh_0, ACESCoefsLow_4, ACESCoefsHigh_4, ACESSceneColorMultiplier, ACESGamutCompression);
+		float3 ODTColor = ACESOutputTransform( GradedColor, (float3x3)WorkingColorSpace.ToAP0, AcesParams);
+#endif
+		ODTColor = mul(AP1_2_Output, ODTColor);
+
+		// Apply conversion to ST-2084 (Dolby PQ)
+		OutDeviceColor = LinearToST2084( ODTColor );
+#endif
+	}
+
+	// ACES transform with PQ/2084 encoding, AP1 gamut
+	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_ACES1000nitScRGB || GetOutputDevice() == TONEMAPPER_OUTPUT_ACES2000nitScRGB)
+	{
+#if (CUSTOM_TONEMAP_MODE != 0) && CUSTOM_HDR_PARITY
+		// PLUGIN HDR: route the custom tonemapper to the scRGB signal (1.0 =
+		// UE_SCRGB_WHITE_NITS).  GT/GT7 exploit the display peak; others use
+		// SDR-parity.  OdtNitsAP1 is in AP1 nits.
+		float3 GradedColorAP1 = mul( (float3x3)WorkingColorSpace.ToAP1, GradedColor );
+		float3 FilmColorAP1   = mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor );
+		float3 OdtNitsAP1 = ShaderShift_HDR_ODTNits( GradedColorAP1, FilmColorAP1, OutputMaxLuminance );
+		OutDeviceColor = mul( AP1_2_sRGB, OdtNitsAP1 / UE_SCRGB_WHITE_NITS );
+#else
+#if USE_ACES_2
+		float3 ODTColor = ACESOutputTransform(GradedColor * ACESSceneColorMultiplier, (float3x3) WorkingColorSpace.ToAP0, OutputMaxLuminance, ACESReachTable, ACESGamutTable, ACESGammaTable);
+#else
+		FACESTonemapParams AcesParams = ComputeACESTonemapParams(ACESMinMaxData, ACESMidData, ACESCoefsLow_0, ACESCoefsHigh_0, ACESCoefsLow_4, ACESCoefsHigh_4, ACESSceneColorMultiplier, ACESGamutCompression);
+		float3 ODTColor = ACESOutputTransform( GradedColor, (float3x3)WorkingColorSpace.ToAP0, AcesParams);
+#endif
+		OutDeviceColor = mul(AP1_2_sRGB, ODTColor / UE_SCRGB_WHITE_NITS);
+#endif
+	}
+	
+	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_LinearEXR)
+	{
+			float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, GradedColor ) );
+			OutDeviceColor = LinearToST2084( OutputGamutColor );
+	}
+	// Linear HDR, including all color correction, but no tone curve
+	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_NoToneCurve)
+	{
+			OutDeviceColor = GradedColor;
+	}
+	// "Linear" including all color correction and the tone curve, but no device gamma
+	else if (GetOutputDevice() == TONEMAPPER_OUTPUT_WithToneCurve)
+	{
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColorNoGamma ) );
+
+		OutDeviceColor = OutputGamutColor;
+	}
+
+	// OutputDevice == TONEMAPPER_OUTPUT_ExplicitGammaMapping
+	// Gamma 2.2, user specified gamut
+	else
+	{
+		// Convert from the working color space to specified output gamut
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
+
+		// This is different than the prior "gamma" curve adjustment (but reusing the variable).
+		// For displays set to a gamma colorspace.
+		// Note, MacOSX native output is raw gamma 2.2 not sRGB!
+		OutDeviceColor = pow( OutputGamutColor, InverseGamma.z );
+	}
+
+	// Better to saturate(lerp(a,b,t)) than lerp(saturate(a),saturate(b),t)
+#if CUSTOM_TONEMAP_MODE == 0
+    OutColor.rgb = OutDeviceColor / 1.05;
+#else
+    OutColor.rgb = OutDeviceColor;
+#endif
+	OutColor.a = 0;
+
+	return OutColor;
+}
+
+// todo: Weight[0] should be used for neutral, Texture* name should start with 1, color correction should apply on top of that
+#if USE_VOLUME_LUT == 1
+void MainPS(FWriteToSliceGeometryOutput Input, out float4 OutColor : SV_Target0)
+{
+	OutColor = CombineLUTsCommon(Input.Vertex.UV, Input.LayerIndex);
+}
+#else
+void MainPS(noperspective float4 InUV : TEXCOORD0, out float4 OutColor : SV_Target0)
+{
+	OutColor = CombineLUTsCommon(InUV.xy, 0);
+}
+#endif
+
+#if COMPUTESHADER
+// xy: Unused, zw: ThreadToUVScale
+float2 OutputExtentInverse;
+
+#if USE_VOLUME_LUT == 1
+RWTexture3D<float4> RWOutputTexture;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID) 
+{
+	float2 UV = ((float2)DispatchThreadId.xy + 0.5f) * OutputExtentInverse;
+	uint LayerIndex = DispatchThreadId.z;
+	
+	float4 OutColor = CombineLUTsCommon(UV, LayerIndex);
+
+	uint3 PixelPos = DispatchThreadId;
+	RWOutputTexture[PixelPos] = OutColor;
+}
+#else
+RWTexture2D<float4> RWOutputTexture;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	float2 UV = ((float2)DispatchThreadId + 0.5f) * OutputExtentInverse;
+	uint LayerIndex = 0;
+	
+	float4 OutColor = CombineLUTsCommon(UV, LayerIndex);
+
+	uint2 PixelPos = DispatchThreadId;
+	RWOutputTexture[PixelPos] = OutColor;
+}
+#endif
+#endif

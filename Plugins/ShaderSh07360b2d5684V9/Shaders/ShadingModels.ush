@@ -1,0 +1,1139 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "DeferredShadingCommon.ush"
+#include "BRDF.ush"
+#include "FastMath.ush"
+#include "CapsuleLight.ush"
+#include "RectLight.ush"
+#include "AreaLightCommon.ush"
+#include "TransmissionCommon.ush"
+#include "HairBsdf.ush"
+#include "ShadingEnergyConservation.ush"
+#include "ParticipatingMediaCommon.ush"
+#include "ColorSpace.ush"
+#include "SGGX.ush"
+#include "PathTracing/Utilities/PathTracingRandomSequence.ush"
+
+// ===========================================================================
+// ShaderShift live-tweak channel (editor look-dev) -- added by ShaderShift.
+//
+// Routes one parameter at a time through the View tweak lanes so it can be
+// dragged in real time with NO shader recompile.  ShadingModels.ush always
+// binds the View uniform buffer (it already samples View.SSProfiles* /
+// View.PreIntegratedBRDF), so this read is valid in every BxDF pass --
+// including the deferred-light pass, where the Scene UB is NOT bound.
+//
+//   round(View.GeneralPurposeTweak) == ParamId -> use View.GeneralPurposeTweak2
+//   otherwise                                  -> baked compile-time default
+// ===========================================================================
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+
+// Live float resolver -- guarded so transitive inclusion can't redefine it.
+#ifndef SHADERSHIFT_LIVE_FLOAT_DEFINED
+#define SHADERSHIFT_LIVE_FLOAT_DEFINED
+float ShaderShift_LiveFloat(float ParamId, float DefaultValue)
+{
+#if SHADERSHIFT_LIVE_TWEAKS
+	return (round(View.GeneralPurposeTweak) == ParamId)
+		? View.GeneralPurposeTweak2
+		: DefaultValue;
+#else
+	return DefaultValue;
+#endif
+}
+#endif // SHADERSHIFT_LIVE_FLOAT_DEFINED
+
+// ShaderShift: push the live (armed) tweak values into BRDF.ush's per-thread
+// globals before any BxDF runs.  Guarded against transitive double-definition
+// (Substrate pulls in ShadingModels.ush).  SHADERSHIFT_LIVE_TWEAKS==0 (cooked)
+// leaves the body empty so the globals keep their baked compile-time defaults.
+// [generated] ShaderShift live-slot decode core (v3 banked) -- Build/gen_live_slots.py.  Do not hand-edit.
+// Focus lane (GeneralPurposeTweak==id) = full-precision knob being dragged now;
+// slot lanes = every dirty knob at 10-bit in the View *OverrideParameter floats
+// (code 1023 = clean -> baked default).  Armed marker = sign bit of BOTH the
+// Specular.x and Normal.x override params -- the only clamp-safe home:
+// SetupCommonViewUniformBufferParameters rewrites Diffuse.yzw + Roughness.y
+// pre-UB.  Mode-exclusive BRDF knobs share bank lanes (diffuse bank 0-16,
+// spec bank 17-20); the control lane (21) carries which diffuse/spec mode owns
+// each bank, so a non-owner knob reads its baked default, never a foreign code.
+#ifndef SSL_ARMED
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_ARMED(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#define SSL_CODE(SYM, MEMBER, LN) ((asuint(SYM.MEMBER) >> ((LN) * 10u)) & 0x3FFu)
+#define SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF) ((SSL_ARMED(SYM) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF))
+#define SSL_CTRL(SYM) SSL_CODE(SYM, NormalOverrideParameter.w, 0u)
+#define SSL_DOWNER(SYM) (SSL_CTRL(SYM) & 0xFu)
+#define SSL_SOWNER(SYM) ((SSL_CTRL(SYM) >> 4u) & 0xFu)
+#define SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF) ((SSL_ARMED(SYM) && (OWN) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF))
+#else
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) (DEF)
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) (DEF)
+#endif
+#endif // SSL_ARMED
+#ifndef SSL_KNOB_4
+#define SSL_KNOB_4(DEF) SSL_KNOBB(View, 4.0, NormalOverrideParameter.y, 2u, SSL_SOWNER(View) == 1u, 0.0, 1.0, DEF) // CUSTOM_SPEC_PRIMARY_WEIGHT [ML bank lane 17]
+#endif
+#ifndef SSL_KNOB_5
+#define SSL_KNOB_5(DEF) SSL_KNOBB(View, 5.0, NormalOverrideParameter.z, 0u, SSL_SOWNER(View) == 1u, 0.0, 2.0, DEF) // CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE [ML bank lane 18]
+#endif
+#ifndef SSL_KNOB_6
+#define SSL_KNOB_6(DEF) SSL_KNOBB(View, 6.0, NormalOverrideParameter.z, 1u, SSL_SOWNER(View) == 1u, 0.0, 4.0, DEF) // CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE [ML bank lane 19]
+#endif
+#ifndef SSL_KNOB_7
+#define SSL_KNOB_7(DEF) SSL_KNOBB(View, 7.0, NormalOverrideParameter.z, 2u, SSL_SOWNER(View) == 1u, 0.0, 1.0, DEF) // CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS [ML bank lane 20]
+#endif
+#ifndef SSL_KNOB_8
+#define SSL_KNOB_8(DEF) SSL_KNOBB(View, 8.0, NormalOverrideParameter.y, 2u, SSL_SOWNER(View) == 2u, 0.0, 1.0, DEF) // CALLISTO_SPEC_FRESNEL_FALLOFF [CD bank lane 17]
+#endif
+#ifndef SSL_KNOB_9
+#define SSL_KNOB_9(DEF) SSL_KNOBB(View, 9.0, NormalOverrideParameter.z, 0u, SSL_SOWNER(View) == 2u, 1.0, 14.0, DEF) // CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE [CD bank lane 18]
+#endif
+#ifndef SSL_KNOB_10
+#define SSL_KNOB_10(DEF) SSL_KNOBB(View, 10.0, NormalOverrideParameter.z, 1u, SSL_SOWNER(View) == 2u, 0.0, 1.0, DEF) // CALLISTO_DUAL_SPEC_OPACITY [CD bank lane 19]
+#endif
+#ifndef SSL_KNOB_11
+#define SSL_KNOB_11(DEF) SSL_KNOBB(View, 11.0, SpecularOverrideParameter.x, 0u, SSL_DOWNER(View) == 5u, 0.0, 8.0, DEF) // CALLISTO_DIFF_FRESNEL [CA bank lane 0]
+#endif
+#ifndef SSL_KNOB_12
+#define SSL_KNOB_12(DEF) SSL_KNOBB(View, 12.0, SpecularOverrideParameter.x, 1u, SSL_DOWNER(View) == 5u, 0.0, 1.0, DEF) // CALLISTO_DIFF_FRESNEL_FALLOFF [CA bank lane 1]
+#endif
+#ifndef SSL_KNOB_13
+#define SSL_KNOB_13(DEF) SSL_KNOBB(View, 13.0, SpecularOverrideParameter.x, 2u, SSL_DOWNER(View) == 5u, 0.0, 1.0, DEF) // CALLISTO_DIFF_FRESNEL_TAN_FALLOFF [CA bank lane 2]
+#endif
+#ifndef SSL_KNOB_14
+#define SSL_KNOB_14(DEF) SSL_KNOBB(View, 14.0, SpecularOverrideParameter.y, 0u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_DIFF_FRESNEL_TINT_R [CA bank lane 3]
+#endif
+#ifndef SSL_KNOB_15
+#define SSL_KNOB_15(DEF) SSL_KNOBB(View, 15.0, SpecularOverrideParameter.y, 1u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_DIFF_FRESNEL_TINT_G [CA bank lane 4]
+#endif
+#ifndef SSL_KNOB_16
+#define SSL_KNOB_16(DEF) SSL_KNOBB(View, 16.0, SpecularOverrideParameter.y, 2u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_DIFF_FRESNEL_TINT_B [CA bank lane 5]
+#endif
+#ifndef SSL_KNOB_17
+#define SSL_KNOB_17(DEF) SSL_KNOBB(View, 17.0, SpecularOverrideParameter.z, 0u, SSL_DOWNER(View) == 5u, 0.0, 8.0, DEF) // CALLISTO_RETRO [CA bank lane 6]
+#endif
+#ifndef SSL_KNOB_18
+#define SSL_KNOB_18(DEF) SSL_KNOBB(View, 18.0, SpecularOverrideParameter.z, 1u, SSL_DOWNER(View) == 5u, 0.0, 1.0, DEF) // CALLISTO_RETRO_FALLOFF [CA bank lane 7]
+#endif
+#ifndef SSL_KNOB_19
+#define SSL_KNOB_19(DEF) SSL_KNOBB(View, 19.0, SpecularOverrideParameter.z, 2u, SSL_DOWNER(View) == 5u, 0.0, 1.0, DEF) // CALLISTO_RETRO_TAN_FALLOFF [CA bank lane 8]
+#endif
+#ifndef SSL_KNOB_20
+#define SSL_KNOB_20(DEF) SSL_KNOBB(View, 20.0, SpecularOverrideParameter.w, 0u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_RETRO_TINT_R [CA bank lane 9]
+#endif
+#ifndef SSL_KNOB_21
+#define SSL_KNOB_21(DEF) SSL_KNOBB(View, 21.0, SpecularOverrideParameter.w, 1u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_RETRO_TINT_G [CA bank lane 10]
+#endif
+#ifndef SSL_KNOB_22
+#define SSL_KNOB_22(DEF) SSL_KNOBB(View, 22.0, SpecularOverrideParameter.w, 2u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_RETRO_TINT_B [CA bank lane 11]
+#endif
+#ifndef SSL_KNOB_23
+#define SSL_KNOB_23(DEF) SSL_KNOBB(View, 23.0, NormalOverrideParameter.x, 0u, SSL_DOWNER(View) == 5u, -1.0, 1.0, DEF) // CALLISTO_SMOOTH_TERM [CA bank lane 12]
+#endif
+#ifndef SSL_KNOB_24
+#define SSL_KNOB_24(DEF) SSL_KNOBB(View, 24.0, NormalOverrideParameter.x, 1u, SSL_DOWNER(View) == 5u, 0.0, 1.0, DEF) // CALLISTO_SMOOTH_TERM_LENGTH [CA bank lane 13]
+#endif
+#ifndef SSL_KNOB_25
+#define SSL_KNOB_25(DEF) SSL_KNOBB(View, 25.0, NormalOverrideParameter.x, 2u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_SMOOTH_TERM_TINT_R [CA bank lane 14]
+#endif
+#ifndef SSL_KNOB_26
+#define SSL_KNOB_26(DEF) SSL_KNOBB(View, 26.0, NormalOverrideParameter.y, 0u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_SMOOTH_TERM_TINT_G [CA bank lane 15]
+#endif
+#ifndef SSL_KNOB_27
+#define SSL_KNOB_27(DEF) SSL_KNOBB(View, 27.0, NormalOverrideParameter.y, 1u, SSL_DOWNER(View) == 5u, 0.0, 2.0, DEF) // CALLISTO_SMOOTH_TERM_TINT_B [CA bank lane 16]
+#endif
+#ifndef SSL_KNOB_28
+#define SSL_KNOB_28(DEF) SSL_KNOBB(View, 28.0, SpecularOverrideParameter.x, 0u, SSL_DOWNER(View) == 6u, 0.0, 4.0, DEF) // CALLISTO_PROXIMA_ALPHA_SCALE [PX bank lane 0]
+#endif
+#ifndef SSL_KNOB_44
+#define SSL_KNOB_44(DEF) ((SHADERSHIFT_LIVE_TWEAKS != 0 && round(View.GeneralPurposeTweak) == 44.0) ? View.GeneralPurposeTweak2 : (SSL_ARMED(View) && SSL_SOWNER(View) == 3u && SSL_CODE(View, NormalOverrideParameter.z, 0u) != 1023u) ? (0.0 + (1.0 - 0.0) * ((float)SSL_CODE(View, NormalOverrideParameter.z, 0u) * (1.0 / 1022.0))) : SSL_DECB(View, SpecularOverrideParameter.x, 1u, SSL_DOWNER(View) == 7u, 0.0, 1.0, DEF)) // REGOLITH_COVERAGE [spec bank lane 18 / diffuse bank lane 1 -- dual-axis Regolith]
+#endif
+#ifndef SSL_KNOB_45
+#define SSL_KNOB_45(DEF) ((SHADERSHIFT_LIVE_TWEAKS != 0 && round(View.GeneralPurposeTweak) == 45.0) ? View.GeneralPurposeTweak2 : (SSL_ARMED(View) && SSL_SOWNER(View) == 3u && SSL_CODE(View, NormalOverrideParameter.z, 1u) != 1023u) ? (0.05 + (1.0 - 0.05) * ((float)SSL_CODE(View, NormalOverrideParameter.z, 1u) * (1.0 / 1022.0))) : SSL_DECB(View, SpecularOverrideParameter.x, 2u, SSL_DOWNER(View) == 7u, 0.05, 1.0, DEF)) // REGOLITH_GRAIN_ROUGHNESS [spec bank lane 19 / diffuse bank lane 2 -- dual-axis Regolith]
+#endif
+#ifndef SSL_KNOB_46
+#define SSL_KNOB_46(DEF) SSL_KNOBB(View, 46.0, SpecularOverrideParameter.x, 0u, SSL_DOWNER(View) == 7u, 0.0, 2.0, DEF) // REGOLITH_RETRO [RD bank lane 0]
+#endif
+#ifndef SSL_KNOB_47
+#define SSL_KNOB_47(DEF) SSL_KNOBB(View, 47.0, NormalOverrideParameter.y, 2u, SSL_SOWNER(View) == 3u, 0.0, 2.0, DEF) // REGOLITH_SHEEN [RS bank lane 17]
+#endif
+#ifndef SSL_KNOB_48
+#define SSL_KNOB_48(DEF) ((SHADERSHIFT_LIVE_TWEAKS != 0 && round(View.GeneralPurposeTweak) == 48.0) ? View.GeneralPurposeTweak2 : (SSL_ARMED(View) && SSL_SOWNER(View) == 3u && SSL_CODE(View, NormalOverrideParameter.z, 2u) != 1023u) ? (0.0 + (1.0 - 0.0) * ((float)SSL_CODE(View, NormalOverrideParameter.z, 2u) * (1.0 / 1022.0))) : SSL_DECB(View, SpecularOverrideParameter.y, 0u, SSL_DOWNER(View) == 7u, 0.0, 1.0, DEF)) // REGOLITH_ROUGHNESS_AFFINITY [spec bank lane 20 / diffuse bank lane 3 -- dual-axis Regolith]
+#endif
+
+#ifndef SHADERSHIFT_LIVE_BRDF_GLOBALS_DEFINED
+#define SHADERSHIFT_LIVE_BRDF_GLOBALS_DEFINED
+void ShaderShift_SetLiveBRDFGlobals()
+{
+#if SHADERSHIFT_LIVE_TWEAKS
+	// [generated] every BRDF tunable resolves focus-lane -> slot-lane -> baked.
+	gSSL_CUSTOM_SPEC_PRIMARY_WEIGHT = SSL_KNOB_4(CUSTOM_SPEC_PRIMARY_WEIGHT);
+	gSSL_CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE = SSL_KNOB_5(CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE);
+	gSSL_CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE = SSL_KNOB_6(CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE);
+	gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS = SSL_KNOB_7(CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS);
+	gSSL_CALLISTO_SPEC_FRESNEL_FALLOFF = SSL_KNOB_8(CALLISTO_SPEC_FRESNEL_FALLOFF);
+	gSSL_CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE = SSL_KNOB_9(CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE);
+	gSSL_CALLISTO_DUAL_SPEC_OPACITY = SSL_KNOB_10(CALLISTO_DUAL_SPEC_OPACITY);
+	gSSL_CALLISTO_DIFF_FRESNEL = SSL_KNOB_11(CALLISTO_DIFF_FRESNEL);
+	gSSL_CALLISTO_DIFF_FRESNEL_FALLOFF = SSL_KNOB_12(CALLISTO_DIFF_FRESNEL_FALLOFF);
+	gSSL_CALLISTO_DIFF_FRESNEL_TAN_FALLOFF = SSL_KNOB_13(CALLISTO_DIFF_FRESNEL_TAN_FALLOFF);
+	gSSL_CALLISTO_DIFF_FRESNEL_TINT_R = SSL_KNOB_14(CALLISTO_DIFF_FRESNEL_TINT_R);
+	gSSL_CALLISTO_DIFF_FRESNEL_TINT_G = SSL_KNOB_15(CALLISTO_DIFF_FRESNEL_TINT_G);
+	gSSL_CALLISTO_DIFF_FRESNEL_TINT_B = SSL_KNOB_16(CALLISTO_DIFF_FRESNEL_TINT_B);
+	gSSL_CALLISTO_RETRO = SSL_KNOB_17(CALLISTO_RETRO);
+	gSSL_CALLISTO_RETRO_FALLOFF = SSL_KNOB_18(CALLISTO_RETRO_FALLOFF);
+	gSSL_CALLISTO_RETRO_TAN_FALLOFF = SSL_KNOB_19(CALLISTO_RETRO_TAN_FALLOFF);
+	gSSL_CALLISTO_RETRO_TINT_R = SSL_KNOB_20(CALLISTO_RETRO_TINT_R);
+	gSSL_CALLISTO_RETRO_TINT_G = SSL_KNOB_21(CALLISTO_RETRO_TINT_G);
+	gSSL_CALLISTO_RETRO_TINT_B = SSL_KNOB_22(CALLISTO_RETRO_TINT_B);
+	gSSL_CALLISTO_SMOOTH_TERM = SSL_KNOB_23(CALLISTO_SMOOTH_TERM);
+	gSSL_CALLISTO_SMOOTH_TERM_LENGTH = SSL_KNOB_24(CALLISTO_SMOOTH_TERM_LENGTH);
+	gSSL_CALLISTO_SMOOTH_TERM_TINT_R = SSL_KNOB_25(CALLISTO_SMOOTH_TERM_TINT_R);
+	gSSL_CALLISTO_SMOOTH_TERM_TINT_G = SSL_KNOB_26(CALLISTO_SMOOTH_TERM_TINT_G);
+	gSSL_CALLISTO_SMOOTH_TERM_TINT_B = SSL_KNOB_27(CALLISTO_SMOOTH_TERM_TINT_B);
+	gSSL_CALLISTO_PROXIMA_ALPHA_SCALE = SSL_KNOB_28(CALLISTO_PROXIMA_ALPHA_SCALE);
+	gSSL_REGOLITH_COVERAGE = SSL_KNOB_44(REGOLITH_COVERAGE);
+	gSSL_REGOLITH_GRAIN_ROUGHNESS = SSL_KNOB_45(REGOLITH_GRAIN_ROUGHNESS);
+	gSSL_REGOLITH_RETRO = SSL_KNOB_46(REGOLITH_RETRO);
+	gSSL_REGOLITH_SHEEN = SSL_KNOB_47(REGOLITH_SHEEN);
+	gSSL_REGOLITH_ROUGHNESS_AFFINITY = SSL_KNOB_48(REGOLITH_ROUGHNESS_AFFINITY);
+#endif
+}
+#endif // SHADERSHIFT_LIVE_BRDF_GLOBALS_DEFINED
+
+
+
+#ifndef HAIR_BSDF_BACKLIT
+#define HAIR_BSDF_BACKLIT 1
+#endif
+
+#if SHADING_PATH_MOBILE
+#include "MobileGGX.ush"
+
+#ifndef MOBILE_SHADOW_QUALITY
+#define MOBILE_SHADOW_QUALITY 2
+#endif
+
+//It's always 0 in mobile deferred lighting shaders
+#ifndef FULLY_ROUGH
+#define FULLY_ROUGH 0
+#endif
+
+//It's always 0 in mobile deferred lighting shaders
+#ifndef NONMETAL
+#define NONMETAL 0
+#endif
+
+//It's always 0 in mobile deferred lighting shaders
+#ifndef MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+#define MATERIAL_SHADINGMODEL_SINGLELAYERWATER 0
+#endif
+
+// Always enabled in mobile deferred lighting shaders
+#ifndef MOBILE_USE_PREINTEGRATED_GF
+#define MOBILE_USE_PREINTEGRATED_GF 1
+#endif
+
+//It's always 1 in mobile deferred lighting shaders
+#ifndef MOBILE_DEFERRED_LIGHTING
+#define MOBILE_DEFERRED_LIGHTING 0
+#endif
+
+#ifndef DEFERRED_SHADING_PATH
+#define DEFERRED_SHADING_PATH 0
+#endif
+
+/*------------------------------------------------------------------------------
+	Mobile Shading Model Functions
+------------------------------------------------------------------------------*/
+half4 GetSSProfilePreIntegratedValue(uint SubsurfaceProfileInt, half NoL, half Curvature)
+{
+	float3 UV = float3((NoL * .5 + .5), Curvature, SubsurfaceProfileInt);
+
+	return Texture2DArraySampleLevel(View.SSProfilesPreIntegratedTexture, View.SSProfilesPreIntegratedSampler, UV, 0);
+}
+
+half3 GetEnvBRDF(half3 SpecularColor, half Roughness, half NoV)
+{
+#if FULLY_ROUGH
+	return 0.0f;
+#elif MOBILE_USE_PREINTEGRATED_GF
+	return EnvBRDF(SpecularColor, Roughness, NoV);
+#elif NONMETAL
+	// If nothing is hooked up to Metalic and Specular,
+	// then defaults are the same as a non-metal,
+	// so this define is safe.
+	return EnvBRDFApproxNonmetal(Roughness, NoV).xxx;
+#else
+	return EnvBRDFApprox(SpecularColor, Roughness, NoV);
+#endif
+}
+#endif // SHADING_PATH_MOBILE
+
+struct FDirectLighting
+{
+	float3	Diffuse;
+	float3	Specular;
+	float3	Transmission;
+};
+
+struct FShadowTerms
+{
+	half	SurfaceShadow;
+	half	TransmissionShadow;
+	half	TransmissionThickness;
+	FHairTransmittanceData HairTransmittance;
+};
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting HairBxDF(FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow)
+{
+	const float3 BsdfValue = HairShading(GBuffer, AreaLight.DiffuseL, V, N, Shadow.TransmissionShadow, Shadow.HairTransmittance, HAIR_BSDF_BACKLIT, 0, uint2(0, 0));
+
+	FDirectLighting Lighting;
+	Lighting.Diffuse = 0;
+	Lighting.Specular = 0;
+	Lighting.Transmission = AreaLight.FalloffColor * AreaLight.Falloff * BsdfValue;
+	return Lighting;
+}
+
+float New_a2( float a2, float SinAlpha, float VoH )
+{
+	return a2 + 0.25 * SinAlpha * (3.0 * sqrtFast(a2) + SinAlpha) / ( VoH + 0.001 );
+	//return a2 + 0.25 * SinAlpha * ( saturate(12 * a2 + 0.125) + SinAlpha ) / ( VoH + 0.001 );
+	//return a2 + 0.25 * SinAlpha * ( a2 * 2 + 1 + SinAlpha ) / ( VoH + 0.001 );
+}
+
+float EnergyNormalization( inout float a2, float VoH, FAreaLight AreaLight )
+{
+	if( AreaLight.SphereSinAlphaSoft > 0 )
+	{
+		// Modify Roughness
+		a2 = saturate( a2 + Pow2( AreaLight.SphereSinAlphaSoft ) / ( VoH * 3.6 + 0.4 ) );
+	}
+
+	float Sphere_a2 = a2;
+	float Energy = 1;
+	if( AreaLight.SphereSinAlpha > 0 )
+	{
+		Sphere_a2 = New_a2( a2, AreaLight.SphereSinAlpha, VoH );
+		Energy = a2 / Sphere_a2;
+	}
+
+	if( AreaLight.LineCosSubtended < 1 )
+	{
+#if 1
+		float LineCosTwoAlpha = AreaLight.LineCosSubtended;
+		float LineTanAlpha = sqrt( ( 1.0001 - LineCosTwoAlpha ) / ( 1 + LineCosTwoAlpha ) );
+		float Line_a2 = New_a2( Sphere_a2, LineTanAlpha, VoH );
+		Energy *= sqrt( Sphere_a2 / max(Line_a2, 1e-5) );
+#else
+		float LineCosTwoAlpha = AreaLight.LineCosSubtended;
+		float LineSinAlpha = sqrt( 0.5 - 0.5 * LineCosTwoAlpha );
+		float Line_a2 = New_a2( Sphere_a2, LineSinAlpha, VoH );
+		Energy *= Sphere_a2 / max(Line_a2, 1e-5);
+#endif
+	}
+
+	return Energy;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+float3 SpecularGGX(float Roughness, float Anisotropy, float3 SpecularColor, BxDFContext Context, FAreaLight AreaLight)
+{
+	float Alpha = Roughness * Roughness;
+	float ax = 0;
+	float ay = 0;
+	GetAnisotropicRoughness(Alpha, Anisotropy, ax, ay);
+
+	// Generalized microfacet specular
+	float3 D = D_GGXaniso(ax, ay, Context.NoH, Context.XoH, Context.YoH);
+	float3 Vis = Vis_SmithJointAniso(ax, ay, Context.NoV, AreaLight.NoL, Context.XoV, Context.XoL, Context.YoV, Context.YoL);
+	float3 F = ShaderShift_F_GGX( SpecularColor, Context.VoH ); // ShaderShift: Callisto Fresnel dispatch (engine F_Schlick unless spec mode 2)
+
+	return (D * Vis) * F;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+float3 SpecularGGX( float Roughness, float3 SpecularColor, BxDFContext Context, FAreaLight AreaLight )
+{
+	float a2 = Pow4( Roughness );
+	float Energy = EnergyNormalization( a2, Context.VoH, AreaLight );
+	
+	// Generalized microfacet specular
+	float D = D_GGX( a2, Context.NoH ) * Energy;
+	float Vis = Vis_SmithJointApprox( a2, Context.NoV, AreaLight.NoL );
+	float3 F = ShaderShift_F_GGX( SpecularColor, Context.VoH ); // ShaderShift: Callisto Fresnel dispatch (engine F_Schlick unless spec mode 2)
+
+	return (D * Vis) * F;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+half3 DualSpecularGGX(half AverageRoughness, half Lobe0Roughness, half Lobe1Roughness, half LobeMix, half3 SpecularColor, BxDFContext Context, FAreaLight AreaLight)
+{
+	float AverageAlpha2 = Pow4(AverageRoughness);
+	float Lobe0Alpha2 = Pow4(Lobe0Roughness);
+	float Lobe1Alpha2 = Pow4(Lobe1Roughness);
+
+	float Lobe0Energy = EnergyNormalization(Lobe0Alpha2, Context.VoH, AreaLight);
+	float Lobe1Energy = EnergyNormalization(Lobe1Alpha2, Context.VoH, AreaLight);
+
+	// Generalized microfacet specular
+	float D = lerp(D_GGX(Lobe0Alpha2, Context.NoH) * Lobe0Energy, D_GGX(Lobe1Alpha2, Context.NoH) * Lobe1Energy, LobeMix);
+	float Vis = Vis_SmithJointApprox(AverageAlpha2, Context.NoV, AreaLight.NoL); // Average visibility well approximates using two separate ones (one per lobe).
+	float3 F = ShaderShift_F_GGX(SpecularColor, Context.VoH); // ShaderShift: Callisto Fresnel dispatch (skin profile dual-spec included)
+
+	return (D * Vis) * F;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting DefaultLitBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	ShaderShift_SetLiveBRDFGlobals();
+	BxDFContext Context;
+	FDirectLighting Lighting;
+	Lighting.Diffuse = 0;
+	Lighting.Specular = 0;
+	Lighting.Transmission = 0;
+
+	BRANCH
+	if (AreaLight.NoL > 0.0f)
+	{
+#if SUPPORTS_ANISOTROPIC_MATERIALS
+		bool bHasAnisotropy = HasAnisotropy(GBuffer.SelectiveOutputMask);
+#else
+		bool bHasAnisotropy = false;
+#endif
+
+		float NoV, VoH, NoH;
+		BRANCH
+		if (bHasAnisotropy)
+		{
+			half3 X = GBuffer.WorldTangent;
+			half3 Y = normalize(cross(N, X));
+			Init(Context, N, X, Y, V, AreaLight.SpecularL);
+
+			NoV = Context.NoV;
+			VoH = Context.VoH;
+			NoH = Context.NoH;
+		}
+		else
+		{
+#if SHADING_PATH_MOBILE
+			InitMobile(Context, N, V, AreaLight.SpecularL, AreaLight.NoL);
+#else
+			Init(Context, N, V, AreaLight.SpecularL);
+#endif
+
+			NoV = Context.NoV;
+			VoH = Context.VoH;
+			NoH = Context.NoH;
+
+			SphereMaxNoH(Context, AreaLight.SphereSinAlpha, true);
+		}
+
+		Context.NoV = saturate(abs( Context.NoV ) + 1e-5);
+
+#if MATERIAL_ROUGHDIFFUSE
+		// Diffuse model with roughness == specular roughness. This is not necessarily a good model of reality because it assumes microfacets with lambertian response.
+		// The limit behavior of SSS as the mean free path gets small behaves differently, but this is a start.
+		// Also we cannot use the morphed context maximising NoH as this is causing visual artefact when interpolating rough/smooth diffuse response. (SUBSTRATE_TODO: Check this again with latest rough diffuse model)
+		Lighting.Diffuse = Diffuse_GGX_Rough(GBuffer.DiffuseColor, GBuffer.Roughness, NoV, AreaLight.NoL, VoH, NoH, GetAreaLightDiffuseMicroReflWeight(AreaLight));
+#else
+		Lighting.Diffuse = Diffuse_GGX_Rough(GBuffer.DiffuseColor, GBuffer.Roughness, NoV, AreaLight.NoL, VoH, NoH, GetAreaLightDiffuseMicroReflWeight(AreaLight));//Diffuse_Ext(GBuffer.DiffuseColor, GBuffer.Roughness, NoV, AreaLight.NoL, VoH);
+#endif
+		Lighting.Diffuse *= AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL);
+
+		BRANCH
+		if (bHasAnisotropy)
+		{
+			Lighting.Specular = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * SpecularGGX(GBuffer.Roughness, GBuffer.Anisotropy, GBuffer.SpecularColor, Context, AreaLight);
+		}
+		else
+		{
+			if( IsRectLight(AreaLight) )
+			{
+				Lighting.Specular = RectGGXApproxLTC(GBuffer.Roughness, GBuffer.SpecularColor, N, V, AreaLight.Rect, AreaLight.Texture);
+			}
+			else
+			{
+				Lighting.Specular = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * SpecularGGX(GBuffer.Roughness, GBuffer.SpecularColor, Context, AreaLight);
+			}
+		}
+
+		FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, GBuffer.SpecularColor);
+
+		// Add energy presevation (i.e. attenuation of the specular layer onto the diffuse component
+		Lighting.Diffuse *= ComputeEnergyPreservation(EnergyTerms);
+
+		// Add specular microfacet multiple scattering term (energy-conservation)
+		Lighting.Specular *= ComputeEnergyConservation(EnergyTerms);
+
+		Lighting.Transmission = 0;
+	}
+
+	return Lighting;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+// Simple default lit model used by Lumen
+float3 SimpleShading( float3 DiffuseColor, float3 SpecularColor, float Roughness, float3 L, float3 V, half3 N )
+{
+	const float NoV = saturate(dot(N, V));
+	const FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(Roughness, NoV, SpecularColor);
+
+	float3 H = normalize(V + L);
+	float NoH = saturate( dot(N, H) );
+	
+	// Generalized microfacet specular
+	float a2 = Pow4(Roughness);
+	float D = D_GGX( a2, NoH );
+	float Vis = Vis_Implicit();
+	float3 F = F_None( SpecularColor );
+
+	return 
+		Diffuse_Ext( DiffuseColor, Roughness, NoV, saturate(dot(N, L)), saturate(dot(V, H)) ) * ComputeEnergyPreservation(EnergyTerms) +
+		(D * Vis) * F * ComputeEnergyConservation(EnergyTerms);
+}
+
+float RefractBlend(float VoH, float Eta)
+{
+	// Refraction blend factor for normal component of VoH
+	float k = 1.0 - Eta * Eta * (1.0 - VoH * VoH);
+	return Eta * VoH - sqrt(k);
+}
+
+half RefractBlendClearCoatApprox(half VoH)
+{
+	// Polynomial approximation of refraction blend factor for normal component of VoH with fixed Eta (1/1.5):
+	return (0.63 - 0.22 * VoH) * VoH - 0.745;
+}
+
+float3 Refract(float3 V, float3 H, float Eta)
+{
+	// Assumes V points away from the point of incidence
+	float VoH = dot(V, H);
+	return RefractBlend(VoH, Eta) * H - Eta * V;
+}
+
+BxDFContext RefractClearCoatContext(BxDFContext Context)
+{
+	// Reference: Propagation of refraction through dot-product NoV
+	// Note: This version of Refract requires V to point away from the point of incidence
+	//  NoV2 = -dot(N, Refract(V, H, Eta))
+	//  NoV2 = -dot(N, RefractBlend(VoH, Eta) * H - Eta * V)
+	//  NoV2 = -(RefractBlend(VoH, Eta) * NoH - Eta * NoV)
+	//  NoV2 = Eta * NoV - RefractBlend(VoH, Eta) * NoH
+	//  NoV2 = 1.0 / 1.5 * NoV - RefractBlendClearCoatApprox(VoH) * NoH
+
+	BxDFContext RefractedContext = Context;
+	half Eta = 1.0 / 1.5;
+	half RefractionBlendFactor = RefractBlendClearCoatApprox(Context.VoH);
+	half RefractionProjectionTerm = RefractionBlendFactor * Context.NoH;
+	RefractedContext.NoV = clamp(Eta * Context.NoV - RefractionProjectionTerm, 0.001, 1.0); // Due to CalcThinTransmission and Vis_SmithJointAniso, we need to make sure
+	RefractedContext.NoL = clamp(Eta * Context.NoL - RefractionProjectionTerm, 0.001, 1.0); // those values are not 0s to avoid NaNs.
+	RefractedContext.VoH = saturate(Eta * Context.VoH - RefractionBlendFactor);
+	RefractedContext.VoL = 2.0 * RefractedContext.VoH * RefractedContext.VoH - 1.0;
+	RefractedContext.NoH = Context.NoH;
+	return RefractedContext;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting ClearCoatBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	// ShaderShift: live BRDF globals (bottom-layer diffuse uses Diffuse_Ext;
+	// both specular lobes route through the D_GGX dispatch).
+	ShaderShift_SetLiveBRDFGlobals();
+
+	const float ClearCoat			= GBuffer.CustomData.x;
+	const float ClearCoatRoughness	= max(GBuffer.CustomData.y, 0.02f);
+
+	FDirectLighting Lighting = {
+		float3(0.0, 0.0, 0.0),
+		float3(0.0, 0.0, 0.0),
+		float3(0.0, 0.0, 0.0)
+	};
+	
+	BxDFContext Context;
+	half3 Nspec = N;
+
+	if (CLEAR_COAT_BOTTOM_NORMAL)
+	{
+		Nspec = GBuffer.WorldNormal;
+	}
+
+#if SUPPORTS_ANISOTROPIC_MATERIALS
+	bool bHasAnisotropy = HasAnisotropy(GBuffer.SelectiveOutputMask);
+#else
+	bool bHasAnisotropy = false;
+#endif
+
+	half3 X = 0;
+	half3 Y = 0;
+
+	//////////////////////////////
+	/// Top Layer
+	//////////////////////////////
+
+	// No anisotropy for the top layer
+	Init(Context, Nspec, V, AreaLight.SpecularL);
+	
+	// Modify SphereSinAlpha, knowing that it was previously manipulated by roughness of the under coat
+	// Note: the operation is not invertible for GBuffer.Roughness = 1.0, so roughness is clamped to 254.0/255.0
+	float SphereSinAlpha = AreaLight.SphereSinAlpha;
+	float RoughnessCompensation = 1 - Pow2(GBuffer.Roughness);
+	half Alpha = ClearCoatRoughness * ClearCoatRoughness;
+	RoughnessCompensation = RoughnessCompensation > 0.0 ? (1 - Alpha) / RoughnessCompensation : 0.0;
+	AreaLight.SphereSinAlpha = saturate(AreaLight.SphereSinAlpha * RoughnessCompensation);
+
+	SphereMaxNoH(Context, AreaLight.SphereSinAlpha, CLEAR_COAT_BOTTOM_NORMAL == 0);
+	Context.NoV = saturate(abs(Context.NoV) + 1e-5);
+	const bool bIsRect = IsRectLight(AreaLight);
+	Context.VoH = bIsRect ? Context.NoV : Context.VoH;
+
+	// Hard-coded Fresnel evaluation with IOR = 1.5 (for polyurethane cited by Disney BRDF)
+	float F0 = 0.04;
+	float Fc = Pow5(1 - Context.VoH);
+	float F = Fc + (1 - Fc) * F0;
+
+	FBxDFEnergyTerms EnergyTermsCoat   = ComputeGGXSpecEnergyTerms(ClearCoatRoughness, Context.NoV, F0);
+
+	if (bIsRect)
+	{
+		Lighting.Specular = ClearCoat * RectGGXApproxLTC(ClearCoatRoughness, F0, Nspec, V, AreaLight.Rect, AreaLight.Texture);
+	}
+	else
+	{
+		// Generalized microfacet specular
+		float a2 = Pow2(Alpha);
+		float ClearCoatEnergy = EnergyNormalization(a2, Context.VoH, AreaLight);
+		half Vis = Vis_SmithJointApprox(a2, Context.NoV, AreaLight.NoL);
+		float D = D_GGX(a2, Context.NoH) * ClearCoatEnergy;
+		half Fr1 = (D * Vis) * F;
+		Lighting.Specular = ClearCoat * AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL * Fr1);
+	}
+	Lighting.Specular *= ComputeEnergyConservation(EnergyTermsCoat);
+
+	// Restore previously changed SphereSinAlpha for the top layer. 
+	// Alpha needs to also be restored to the bottom layer roughness.
+	AreaLight.SphereSinAlpha = SphereSinAlpha;
+	Alpha = Pow2(GBuffer.Roughness);
+
+	// Incoming and exiting Fresnel terms are identical to incoming Fresnel term (VoH == HoL)
+	// float FresnelCoeff = (1.0 - F1) * (1.0 - F2);
+	#if USE_ENERGY_CONSERVATION
+	float3 FresnelCoeff = ComputeEnergyPreservation(EnergyTermsCoat); // 1.0 - F;
+	#else
+	// Preserve old behavior when energy conservation is disabled
+	half FresnelCoeff = 1.0 - F;
+	#endif
+	FresnelCoeff *= FresnelCoeff;
+
+	//////////////////////////////
+	/// Bottom Layer
+	//////////////////////////////
+
+	if (CLEAR_COAT_BOTTOM_NORMAL)
+	{
+		BxDFContext TempContext;
+
+		BRANCH
+		if (bHasAnisotropy)
+		{
+			Init(TempContext, N, X, Y, V, AreaLight.SpecularL);
+		}
+		else
+		{
+			Init(TempContext, Nspec, V, AreaLight.SpecularL);
+		}
+
+		// If bottom-normal, update normal-based dot products:
+		float3 H = normalize(V + AreaLight.SpecularL);
+		Context.NoH = saturate(dot(N, H));
+		Context.NoV = saturate(dot(N, V));
+		Context.NoL = saturate(dot(N, AreaLight.SpecularL));
+		Context.VoL = saturate(dot(V, AreaLight.SpecularL));
+		Context.VoH = saturate(dot(V, H));
+
+		Context.XoV = TempContext.XoV;
+		Context.XoL = TempContext.XoL;
+		Context.XoH = TempContext.XoH;
+		Context.YoV = TempContext.YoV;
+		Context.YoL = TempContext.YoL;
+		Context.YoH = TempContext.YoH;
+
+		if (!bHasAnisotropy)
+		{
+			bool bNewtonIteration = true;
+			SphereMaxNoH(Context, AreaLight.SphereSinAlpha, bNewtonIteration);
+		}
+
+		Context.NoV = saturate(abs(Context.NoV) + 1e-5);
+	}
+
+	// Propagate refraction through dot-products rather than the original vectors:
+	// Reference:
+	//   float Eta = 1.0 / 1.5;
+	//   float3 H = normalize(V + L);
+	//   float3 V2 = Refract(V, H, Eta);
+	//   float3 L2 = reflect(V2, H);
+	//   V2 = -V2;
+	//   BxDFContext BottomContext;
+	//   Init(BottomContext, N, X, Y, V2, L2);
+	if (bHasAnisotropy)
+	{
+		// Prepare the anisotropic Context to refract.
+		X = GBuffer.WorldTangent;
+		Y = normalize(cross(N, X));
+		Init(Context, Nspec, X, Y, V, AreaLight.SpecularL);
+	}
+	BxDFContext BottomContext = RefractClearCoatContext(Context);
+	BottomContext.VoH = bIsRect ? BottomContext.NoV : BottomContext.VoH;
+
+	FBxDFEnergyTerms EnergyTermsBottom = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, BottomContext.NoV, GBuffer.SpecularColor);
+
+	// Absorption
+	float3 Transmission = SimpleClearCoatTransmittance(BottomContext.NoL, BottomContext.NoV, GBuffer.Metallic, GBuffer.BaseColor);
+
+	// Default Lit
+	half3 DefaultDiffuse = (AreaLight.Falloff * AreaLight.NoL) * AreaLight.FalloffColor * Diffuse_Ext(GBuffer.DiffuseColor, GBuffer.Roughness, BottomContext.NoV, BottomContext.NoL, BottomContext.VoH) * ComputeEnergyPreservation(EnergyTermsBottom);
+	half3 RefractedDiffuse = FresnelCoeff * Transmission * DefaultDiffuse;
+	Lighting.Diffuse = lerp(DefaultDiffuse, RefractedDiffuse, ClearCoat);
+
+	if (!bHasAnisotropy && bIsRect)
+	{
+		// Note: V is used instead of V2 because LTC integration is not tuned to handle refraction direction
+		float3 DefaultSpecular = RectGGXApproxLTC(GBuffer.Roughness, GBuffer.SpecularColor, N, V, AreaLight.Rect, AreaLight.Texture);
+		float3 RefractedSpecular = FresnelCoeff * Transmission * DefaultSpecular;
+		Lighting.Specular += lerp(DefaultSpecular, RefractedSpecular, ClearCoat);
+	}
+	else
+	{
+		float a2 = Pow4(GBuffer.Roughness);
+		half D2 = 0;
+		half Vis2 = 0;
+
+		// The energy factor for correcting area light shape needs to be computed "before" the actual D_GGX term, 
+		// as calling EnergyNormalization() modify the "a2" value.
+		float Energy = 1;
+		BRANCH
+		if (!bHasAnisotropy)
+		{
+			Energy = EnergyNormalization(a2, Context.VoH, AreaLight);
+		}
+
+		BRANCH
+		if (bHasAnisotropy)
+		{
+			float ax = 0;
+			float ay = 0;
+			GetAnisotropicRoughness(Alpha, GBuffer.Anisotropy, ax, ay); 
+
+			D2 = D_GGXaniso(ax, ay, Context.NoH, Context.XoH, Context.YoH);
+			Vis2 = Vis_SmithJointAniso(ax, ay, BottomContext.NoV, BottomContext.NoL, BottomContext.XoV, BottomContext.XoL, BottomContext.YoV, BottomContext.YoL);
+		}
+		else
+		{
+			// NoL is chosen to provide better parity with DefaultLit when ClearCoat=0
+			Vis2 = Vis_SmithJointApprox(a2, BottomContext.NoV, AreaLight.NoL);
+			D2 = D_GGX(a2, BottomContext.NoH);
+		}
+		half3 F_Bot = F_Schlick(GBuffer.SpecularColor, BottomContext.VoH);
+		half3 F_DefaultLit = F_Schlick(GBuffer.SpecularColor, Context.VoH);
+		
+
+		// Note: reusing D and V from refracted context to save computation when ClearCoat < 1
+		float3 CommonSpecular = (Energy * AreaLight.Falloff * AreaLight.NoL * D2 * Vis2) * AreaLight.FalloffColor;
+		float3 DefaultSpecular = F_DefaultLit;
+		float3 RefractedSpecular = FresnelCoeff * Transmission * F_Bot;
+		Lighting.Specular += CommonSpecular * lerp(DefaultSpecular, RefractedSpecular, ClearCoat);
+	}
+
+	return Lighting;
+}
+
+// HG phase function approximated
+float ApproximateHG(float cosJ, float g)
+{
+	float g2 = g * g;
+	float gcos2 = 1.0f - (g * cosJ);
+	gcos2 *= gcos2;
+
+	const float ISO_PHASE_FUNC_Normalized = 0.5;
+
+	return (ISO_PHASE_FUNC_Normalized * (1.0f - g2) / max( 1e-5, gcos2));
+}
+
+void GetProfileDualSpecular(uint SubsurfaceProfileInt, half Roughness, half Opacity, out half LobeRoughness0, out half LobeRoughness1, out half LobeMix)
+{
+#if !FORWARD_SHADING
+	GetSubsurfaceProfileDualSpecular(SubsurfaceProfileInt, Roughness, Opacity, LobeRoughness0, LobeRoughness1, LobeMix);
+#else
+	// Disable dual lobe, as subsurface profile doesn't work with forward.
+	LobeRoughness0 = Roughness;
+	LobeRoughness1 = Roughness;
+	LobeMix = 0.f;
+#endif
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting SubsurfaceProfileBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	// ShaderShift: refresh the live BRDF globals -- SKIN routes its diffuse
+	// through Diffuse_Ext/Diffuse_GGX_Rough and its dual-lobe profile specular
+	// through the D_GGX dispatch, so the custom BRDF knobs must be live here
+	// exactly as in DefaultLitBxDF (without this call they'd be baked-only).
+	ShaderShift_SetLiveBRDFGlobals();
+
+	BxDFContext Context;
+#if SHADING_PATH_MOBILE
+	InitMobile(Context, N, V, AreaLight.SpecularL, AreaLight.NoL);
+#else
+	Init( Context, N, V, AreaLight.SpecularL );
+#endif
+	SphereMaxNoH( Context, AreaLight.SphereSinAlpha, true );
+	Context.NoV = saturate( abs( Context.NoV ) + 1e-5 );
+
+	uint SubsurfaceProfileId = ExtractSubsurfaceProfileInt(GBuffer);
+	half Opacity = GBuffer.CustomData.a;
+	half Roughness = GBuffer.Roughness;
+
+	half Lobe0Roughness = 0;
+	half Lobe1Roughness = 0;
+	half LobeMix = 0;
+
+	GetProfileDualSpecular(SubsurfaceProfileId, Roughness, Opacity, Lobe0Roughness, Lobe1Roughness, LobeMix);
+	half AverageRoughness = lerp(Lobe0Roughness, Lobe1Roughness, LobeMix);
+
+	// Take the average roughness instead of compute a separate energy term for each roughness
+	const FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(AverageRoughness, Context.NoV, GBuffer.SpecularColor);
+
+	FDirectLighting Lighting;
+#if SHADING_PATH_MOBILE
+	half Curvature = GBuffer.Curvature;
+	half UnClampedNoL = dot(GBuffer.WorldNormal, AreaLight.DiffuseL);
+	half ShadowFactor = 1.0f - sqrt(Shadow.SurfaceShadow);
+	// Rotate the world normal based on the shadow value, it's just a experimental value 
+	half UnClampedRotatedNoL = max(UnClampedNoL - max(2.0f * UnClampedNoL, 0.4f) * ShadowFactor, -1.0f);
+	half4 BurleyDiffuse = GetSSProfilePreIntegratedValue(SubsurfaceProfileId, UnClampedRotatedNoL, Curvature);
+	// asset specific color
+	half3 Tint = GetSubsurfaceProfileTexture(SSSS_TINT_SCALE_OFFSET, SubsurfaceProfileId).rgb;
+	
+	// Needs to apply shadow at here, since the preintegrated value has already counted it, and we need to skip applying shadow outside.
+	Lighting.Diffuse = lerp(AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * Shadow.SurfaceShadow, BurleyDiffuse.rgb, Tint) * Diffuse_Ext(GBuffer.DiffuseColor, GBuffer.Roughness, Context.NoV, AreaLight.NoL, Context.VoH);
+#else
+
+#if MATERIAL_ROUGHDIFFUSE
+	// Use Chan's diffuse model. It reduces flatness look and has better match, e.g., at the edge of human face skin when compared to GT.
+	const float3 DiffuseReflection = Diffuse_GGX_Rough(GBuffer.DiffuseColor, GBuffer.Roughness, Context.NoV, AreaLight.NoL, Context.VoH, Context.NoH, GetAreaLightDiffuseMicroReflWeight(AreaLight));
+#else
+	const float3 DiffuseReflection = Diffuse_Ext(GBuffer.DiffuseColor, GBuffer.Roughness, Context.NoV, AreaLight.NoL, Context.VoH);
+#endif
+
+	Lighting.Diffuse  = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * DiffuseReflection;
+#endif
+
+	if (IsRectLight(AreaLight))
+	{
+		float3 Lobe0Specular = RectGGXApproxLTC(Lobe0Roughness, GBuffer.SpecularColor, N, V, AreaLight.Rect, AreaLight.Texture);
+		float3 Lobe1Specular = RectGGXApproxLTC(Lobe1Roughness, GBuffer.SpecularColor, N, V, AreaLight.Rect, AreaLight.Texture);
+		Lighting.Specular = lerp(Lobe0Specular, Lobe1Specular, LobeMix);
+	}
+	else
+	{
+		Lighting.Specular = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * DualSpecularGGX(AverageRoughness, Lobe0Roughness, Lobe1Roughness, LobeMix, GBuffer.SpecularColor, Context, AreaLight);
+	}
+
+	Lighting.Diffuse  *= ComputeEnergyPreservation(EnergyTerms);
+	Lighting.Specular *= ComputeEnergyConservation(EnergyTerms);
+
+#if USE_TRANSMISSION
+
+	const uint ProfileId = ExtractSubsurfaceProfileInt(GBuffer);
+	FTransmissionProfileParams TransmissionParams = GetTransmissionProfileParams(ProfileId);
+
+	float Thickness = Shadow.TransmissionThickness;
+	Thickness = DecodeThickness(Thickness);
+	Thickness *= SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE;
+	float3 Profile = GetTransmissionProfile(ProfileId, Thickness).rgb;
+
+	float3 RefracV = refract(V, -N, TransmissionParams.OneOverIOR);
+	float PhaseFunction = ApproximateHG( dot(-AreaLight.DiffuseL, RefracV), TransmissionParams.ScatteringDistribution );
+	Lighting.Transmission = AreaLight.FalloffColor * Profile * (AreaLight.Falloff * PhaseFunction); // TODO: This probably should also include cosine term (NoL)
+
+#else // USE_TRANSMISSION
+
+	Lighting.Transmission = 0;
+
+#endif // USE_TRANSMISSION
+
+	return Lighting;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting ClothBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	// ShaderShift: live BRDF globals (diffuse uses Diffuse_Ext; the GGX lobe
+	// routes through the D_GGX dispatch).
+	ShaderShift_SetLiveBRDFGlobals();
+
+	const float3 FuzzColor	= ExtractSubsurfaceColor(GBuffer);
+	const float  Cloth		= saturate(GBuffer.CustomData.a);
+
+	BxDFContext Context;
+#if SHADING_PATH_MOBILE
+	InitMobile(Context, N, V, AreaLight.SpecularL, AreaLight.NoL);
+#else
+	Init( Context, N, V, AreaLight.SpecularL );
+#endif
+	SphereMaxNoH( Context, AreaLight.SphereSinAlpha, true );
+	Context.NoV = saturate( abs( Context.NoV ) + 1e-5 );
+
+	float3 Spec1;
+	if(IsRectLight(AreaLight))
+		Spec1 = RectGGXApproxLTC( GBuffer.Roughness, GBuffer.SpecularColor, N, V, AreaLight.Rect, AreaLight.Texture );
+	else
+		Spec1 = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * SpecularGGX( GBuffer.Roughness, GBuffer.SpecularColor, Context, AreaLight );
+
+	const FBxDFEnergyTerms EnergyTerms1 = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, GBuffer.SpecularColor);
+	Spec1 *= ComputeEnergyConservation(EnergyTerms1);
+
+	// Cloth - Asperity Scattering - Inverse Beckmann Layer
+	float D2 = D_InvGGX( Pow4( GBuffer.Roughness ), Context.NoH );
+	float Vis2 = Vis_Cloth( Context.NoV, AreaLight.NoL );
+#if SHADING_PATH_MOBILE
+	Vis2 = saturate(Vis2);
+#endif
+	float3 F2 = F_Schlick( FuzzColor, Context.VoH );
+	float3 Spec2 = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * (D2 * Vis2) * F2;
+	
+	const FBxDFEnergyTermsA EnergyTerms2 = ComputeClothEnergyTermsA(GBuffer.Roughness, Context.NoV);
+	Spec2 *= ComputeEnergyConservation(EnergyTerms2);
+
+	FDirectLighting Lighting;
+	Lighting.Diffuse  = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * Diffuse_Ext( GBuffer.DiffuseColor, GBuffer.Roughness, Context.NoV, AreaLight.NoL, Context.VoH ); 
+	Lighting.Specular = lerp( Spec1, Spec2, Cloth );
+	Lighting.Transmission = 0;
+
+	Lighting.Diffuse *= lerp(ComputeEnergyPreservation(EnergyTerms1), ComputeEnergyPreservation(EnergyTerms2), Cloth);
+
+	return Lighting;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting SubsurfaceBxDF(FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	FDirectLighting Lighting = DefaultLitBxDF( GBuffer, N, V, AreaLight, Shadow);
+
+	half3 SubsurfaceColor = ExtractSubsurfaceColor(GBuffer);
+	half Opacity = GBuffer.CustomData.a;
+
+	// to get an effect when you see through the material
+	// hard coded pow constant
+	half InScatter = pow(saturate(dot(AreaLight.DiffuseL, -V)), 12) * lerp(3, .1f, Opacity);
+
+	// Wrap around lighting, 
+	// * /(PI*2) to be energy consistent (hack do get some view dependnt and light dependent effect)
+	// * Opacity of 0 gives no normal dependent lighting, Opacity of 1 gives strong normal contribution	
+	// * Simplified version (with w=.5,  n=1.5): 
+	//     half WrappedDiffuse = 2 * pow(saturate((dot(N, L) + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w));
+	//     NormalContribution = WrappedDiffuse * Opacity + 1 - Opacity;
+	const half WrappedDiffuse = pow(saturate(dot(N, AreaLight.DiffuseL) * (1.f / 1.5f) + (0.5f / 1.5f)), 1.5f) * (2.5f / 1.5f);
+	const half NormalContribution = lerp(1.f, WrappedDiffuse, Opacity);
+	const half BackScatter = GBuffer.GBufferAO * NormalContribution / (PI * 2);
+
+	// Transmission
+	// * Emulate Beer-Lambert absorption by retrieving extinction coefficient from SubSurfaceColor. Subsurface is interpreted as a 'transmittance color' 
+	//   at a certain 'normalized' distance (SubSurfaceColorAsTransmittanceAtDistanceInMeters). This is a coarse approximation for getting hue-shiting. 
+	// * TransmittedColor is computed for the 1-normalized distance, and then transformed back-and-forth in HSV space to preserving the luminance value 
+	//   of the original color, but getting hue shifting
+	const half3 ExtinctionCoefficients = TransmittanceToExtinction(SubsurfaceColor, View.SubSurfaceColorAsTransmittanceAtDistanceInMeters);
+	const half3 RawTransmittedColor = ExtinctionToTransmittance(ExtinctionCoefficients, 1.0f /*At 1 meters, as we use normalized units*/);
+	const half3 TransmittedColor = HSV_2_LinearRGB(half3(LinearRGB_2_HSV(RawTransmittedColor).xy, LinearRGB_2_HSV(SubsurfaceColor).z));
+
+	// lerp to never exceed 1 (energy conserving)
+	Lighting.Transmission = AreaLight.FalloffColor * (AreaLight.Falloff * lerp(BackScatter, 1, InScatter)) * lerp(TransmittedColor, SubsurfaceColor, Shadow.TransmissionThickness);
+
+	return Lighting;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting TwoSidedBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	half3 SubsurfaceColor = ExtractSubsurfaceColor(GBuffer);
+
+	FDirectLighting Lighting = DefaultLitBxDF( GBuffer, N, V, AreaLight, Shadow );
+
+	// http://blog.stevemcauley.com/2011/12/03/energy-conserving-wrapped-diffuse/
+	half Wrap = 0.5;
+	half WrapNoL = saturate( ( -dot(N, AreaLight.DiffuseL) + Wrap ) / Square( 1 + Wrap ) );
+
+	// Scatter distribution
+	half VoL = dot(V, AreaLight.DiffuseL);
+	float Scatter = D_GGX( 0.6*0.6, saturate( -VoL ) );
+
+	Lighting.Transmission = AreaLight.FalloffColor * (AreaLight.Falloff * WrapNoL * Scatter) * SubsurfaceColor;
+
+	return Lighting;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate
+FDirectLighting EyeBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	// ShaderShift: live BRDF globals (transmission diffuse uses Diffuse_Ext;
+	// specular routes through the D_GGX dispatch).
+	ShaderShift_SetLiveBRDFGlobals();
+
+#if IRIS_NORMAL
+	const float2 CausticNormalDelta	= float2( GBuffer.StoredMetallic, GBuffer.StoredSpecular )	* 2 - (256.0/255.0);
+	const float2 IrisNormalDelta	= float2( GBuffer.CustomData.y, GBuffer.CustomData.z )		* 2 - (256.0/255.0);
+	const float  IrisMask = 1.0f - GBuffer.CustomData.w;
+
+	const float2 WorldNormalOct	= UnitVectorToOctahedron( GBuffer.WorldNormal );
+	const float3 CausticNormal	= OctahedronToUnitVector( WorldNormalOct + CausticNormalDelta );
+	const float3 IrisNormal		= OctahedronToUnitVector( WorldNormalOct + IrisNormalDelta );
+#else
+	const float3 IrisNormal		= OctahedronToUnitVector( GBuffer.CustomData.yz * 2 - 1 );
+	const float  IrisDistance	= GBuffer.StoredMetallic;
+	const float  IrisMask		= 1.0f - GBuffer.CustomData.w;
+
+	// Blend in the negative intersection normal to create some concavity
+	// Not great as it ties the concavity to the convexity of the cornea surface
+	// No good justification for that. On the other hand, if we're just looking to
+	// introduce some concavity, this does the job.
+	const float3 CausticNormal = normalize(lerp(IrisNormal, -N, IrisMask*IrisDistance));
+#endif
+
+	BxDFContext Context;
+#if SHADING_PATH_MOBILE
+	InitMobile(Context, N, V, AreaLight.SpecularL, AreaLight.NoL);
+#else
+	Init( Context, N, V, AreaLight.SpecularL );
+#endif
+	SphereMaxNoH( Context, AreaLight.SphereSinAlpha, false );
+	Context.NoV = saturate( abs( Context.NoV ) + 1e-5 );
+	const bool bIsRect = IsRectLight(AreaLight);
+	Context.VoH = bIsRect ? Context.NoV : Context.VoH;
+	
+	// F_Schlick
+	float F0 = GBuffer.Specular * 0.08;
+	float Fc = Pow5( 1 - Context.VoH );
+	float F = Fc + (1 - Fc) * F0;
+	
+	const FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, F0);
+
+	FDirectLighting Lighting;
+
+	if( bIsRect )
+	{
+		Lighting.Specular = RectGGXApproxLTC( GBuffer.Roughness, F0, N, V, AreaLight.Rect, AreaLight.Texture );
+	}
+	else
+	{
+		float a2 = Pow4( GBuffer.Roughness );
+		float Energy = EnergyNormalization( a2, Context.VoH, AreaLight );
+		// Generalized microfacet specular
+		float Vis = Vis_SmithJointApprox(a2, Context.NoV, AreaLight.NoL);
+		float D = D_GGX(a2, Context.NoH) * Energy;
+		Lighting.Specular = AreaLight.FalloffColor * (AreaLight.Falloff * AreaLight.NoL) * D * Vis * F;
+	}
+
+	float IrisNoL = saturate( dot( IrisNormal, AreaLight.SpecularL ) );
+	float Power = lerp( 12, 1, IrisNoL );
+	float Caustic = 0.8 + 0.2 * ( Power + 1 ) * pow( saturate( dot( CausticNormal, AreaLight.SpecularL ) ), Power );
+	float Iris = IrisNoL * Caustic;
+	float Sclera = AreaLight.NoL;
+	
+	Lighting.Specular *= ComputeEnergyConservation(EnergyTerms);
+
+#if USE_ENERGY_CONSERVATION
+	const float3 EnergyPreservation = ComputeEnergyPreservation(EnergyTerms);
+#else
+	// Preserve old behavior when energy conservation is disabled
+	const float EnergyPreservation = 1.0f - F;
+#endif
+
+	Lighting.Diffuse = 0;
+	Lighting.Transmission = AreaLight.FalloffColor * ( AreaLight.Falloff * lerp( Sclera, Iris, IrisMask ) * EnergyPreservation ) * Diffuse_Ext( GBuffer.DiffuseColor, GBuffer.Roughness, Context.NoV, AreaLight.NoL, Context.VoH );
+#if SHADING_PATH_MOBILE
+	uint SubsurfaceProfileId = ExtractSubsurfaceProfileInt(GBuffer);
+	half Curvature = GBuffer.Curvature;
+	half ShadowFactor = 1.0f - sqrt(Shadow.SurfaceShadow);
+	
+	// Rotate the world normal based on the shadow value, it's just a experimental value 
+	half UnClampedNoL = dot(GBuffer.WorldNormal, AreaLight.DiffuseL);
+	half UnClampedRotatedNoL = max(UnClampedNoL - max(2.0f * UnClampedNoL, 0.4f) * ShadowFactor, -1.0f);
+	half4 BurleyDiffuse = GetSSProfilePreIntegratedValue(SubsurfaceProfileId, UnClampedRotatedNoL, Curvature);
+
+	// Rotate the world normal based on the shadow value, it's just a experimental value 
+	half UnClampedIrisNoL = dot(IrisNormal, AreaLight.SpecularL);
+	half UnClampedRotatedIrisNoL = max(UnClampedIrisNoL - max(2.0f * UnClampedIrisNoL, 0.4f) * ShadowFactor, -1.0f);
+	half4 IrisBurleyDiffuse = GetSSProfilePreIntegratedValue(SubsurfaceProfileId, UnClampedRotatedIrisNoL * Caustic, Curvature);
+	// asset specific color
+	half3 Tint = GetSubsurfaceProfileTexture(SSSS_TINT_SCALE_OFFSET, SubsurfaceProfileId).rgb;
+
+	// Needs to apply shadow at here, since the preintegrated value has already counted it, and we need to skip applying shadow outside.
+	Lighting.Transmission = lerp(Lighting.Transmission * Shadow.SurfaceShadow, AreaLight.Falloff * lerp(BurleyDiffuse.rgb, IrisBurleyDiffuse.rgb, IrisMask) * Diffuse_Ext(GBuffer.DiffuseColor, GBuffer.Roughness, Context.NoV, AreaLight.NoL, Context.VoH), Tint);
+#endif
+	return Lighting;
+}
+
+FDirectLighting PreintegratedSkinBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	FDirectLighting Lighting = DefaultLitBxDF( GBuffer, N, V, AreaLight, Shadow );
+	
+	half3 SubsurfaceColor = ExtractSubsurfaceColor(GBuffer);
+	half Opacity = GBuffer.CustomData.a;
+
+	half3 PreintegratedBRDF = Texture2DSampleLevel(View.PreIntegratedBRDF, View.PreIntegratedBRDFSampler, float2(saturate(dot(N, AreaLight.DiffuseL) * .5 + .5), 1 - Opacity), 0).rgb;
+	Lighting.Transmission = AreaLight.FalloffColor * AreaLight.Falloff * PreintegratedBRDF * SubsurfaceColor;
+
+	return Lighting;
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate - Substrate uses SubstrateEvaluateBSDFCommon() instead
+FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	switch( GBuffer.ShadingModelID )
+	{
+		case SHADINGMODELID_DEFAULT_LIT:
+		case SHADINGMODELID_SINGLELAYERWATER:
+		case SHADINGMODELID_THIN_TRANSLUCENT:
+			return DefaultLitBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_SUBSURFACE:
+			return SubsurfaceBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_PREINTEGRATED_SKIN:
+			return PreintegratedSkinBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_CLEAR_COAT:
+			return ClearCoatBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_SUBSURFACE_PROFILE:
+			return SubsurfaceProfileBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_TWOSIDED_FOLIAGE:
+			return TwoSidedBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_HAIR:
+			return HairBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_CLOTH:
+			return ClothBxDF( GBuffer, N, V, AreaLight, Shadow );
+		case SHADINGMODELID_EYE:
+			return EyeBxDF( GBuffer, N, V, AreaLight, Shadow );
+		default:
+			return (FDirectLighting)0;
+	}
+}
+
+// UE_DEPRECATED 5.7 - Deprecated by Substrate - Substrate uses SubstrateEvaluateBSDFCommon() instead
+FDirectLighting EvaluateBxDF( FGBufferData GBuffer, half3 N, half3 V, half3 L, float NoL, FShadowTerms Shadow )
+{
+	FAreaLight AreaLight = InitAreaLight();
+	AreaLight.DiffuseL = L;
+	AreaLight.SpecularL = L;
+	AreaLight.NoL = NoL;
+
+	return IntegrateBxDF( GBuffer, N, V, AreaLight, Shadow );
+}

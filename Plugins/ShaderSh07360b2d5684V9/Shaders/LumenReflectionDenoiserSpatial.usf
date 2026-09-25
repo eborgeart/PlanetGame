@@ -1,0 +1,261 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// ShaderShift: opt this pass OUT of the sharp-trace roughness pull inside
+// LumenReflectionCommon.ush::ApplySmoothBias.  The spatial denoiser must see
+// the TRUE material roughness so its kernel radius / lobe angle stay wide
+// enough to reconstruct the rough appearance from the sharpened trace.
+#define SHADERSHIFT_REFL_DENOISER_PASS 1
+
+#include "../Common.ush"
+#include "../SceneTextureParameters.ush"
+
+// === ShaderShift live-tweak macro (editor look-dev; see ShaderShiftRuntimeParams.h) ===
+// Expands inline at the use site (View is bound there).  Packaged builds set
+// SHADERSHIFT_LIVE_TWEAKS 0, collapsing it to the bare compile-time default.
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+// [generated] ShaderShift live-slot decode core (v3 banked) -- Build/gen_live_slots.py.  Do not hand-edit.
+// Focus lane (GeneralPurposeTweak==id) = full-precision knob being dragged now;
+// slot lanes = every dirty knob at 10-bit in the View *OverrideParameter floats
+// (code 1023 = clean -> baked default).  Armed marker = sign bit of BOTH the
+// Specular.x and Normal.x override params -- the only clamp-safe home:
+// SetupCommonViewUniformBufferParameters rewrites Diffuse.yzw + Roughness.y
+// pre-UB.  Mode-exclusive BRDF knobs share bank lanes (diffuse bank 0-16,
+// spec bank 17-20); the control lane (21) carries which diffuse/spec mode owns
+// each bank, so a non-owner knob reads its baked default, never a foreign code.
+#ifndef SSL_ARMED
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_ARMED(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#define SSL_CODE(SYM, MEMBER, LN) ((asuint(SYM.MEMBER) >> ((LN) * 10u)) & 0x3FFu)
+#define SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF) ((SSL_ARMED(SYM) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF))
+#define SSL_CTRL(SYM) SSL_CODE(SYM, NormalOverrideParameter.w, 0u)
+#define SSL_DOWNER(SYM) (SSL_CTRL(SYM) & 0xFu)
+#define SSL_SOWNER(SYM) ((SSL_CTRL(SYM) >> 4u) & 0xFu)
+#define SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF) ((SSL_ARMED(SYM) && (OWN) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF))
+#else
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) (DEF)
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) (DEF)
+#endif
+#endif // SSL_ARMED
+#ifndef SSL_KNOB_32
+#define SSL_KNOB_32(DEF) SSL_KNOB(View, 32.0, AmbientOcclusionOverrideParameter.x, 2u, 0.0, 1.0, DEF) // CUSTOM_GRAD_REFL_STRENGTH [lane 32]
+#endif
+#include "LumenReflectionCommon.ush"
+#include "LumenReflectionDenoiserCommon.ush"
+#if DEBUG_MODE
+	#include "../ShaderPrint.ush"
+#endif
+
+Texture2DArray<float4> SpecularLightingAndSecondMomentTexture;
+Texture2DArray<UNORM float> NumFramesAccumulatedTexture;
+RWTexture2DArray<float3> RWSpecularIndirectAccumulated;
+
+Texture2D<float3> BackgroundVisibilityTexture;
+RWTexture2D<float4> RWTranslucencyLighting;
+
+uint ClosureIndex;
+float SpatialFilterDepthWeightScale;
+float SpatialFilterKernelRadius;
+uint SpatialFilterNumSamples;
+float TemporalMaxFramesAccumulated;
+uint bCompositeSceneColor;
+
+float3 TonemapLighting(float3 Lighting, float DisocclusionFactor)
+{
+	// Run heavy tonemapping for DisocclusionFactor in order to suppress fireflies in new areas
+	return Lighting / (1.0f + DisocclusionFactor * Luminance(Lighting));
+}
+
+float3 InverseTonemapLighting(float3 TonemappedLighting, float DisocclusionFactor)
+{
+	return TonemappedLighting / (1.0f - DisocclusionFactor * Luminance(TonemappedLighting));
+}
+
+// Workaround for Substrate fetching invalid value at tile border
+bool IsLightingValidForDenoiser(float3 In)
+{
+#if SUBSTRATE_GBUFFER_FORMAT==1
+	return all(In < INVALID_LIGHTING);
+#else
+	return IsLightingValid(In);
+#endif
+}
+
+/**
+ * Run a spatial filter in order to filter out noise based on the temporal variance.
+ */
+[numthreads(REFLECTION_THREADGROUP_SIZE_2D, REFLECTION_THREADGROUP_SIZE_2D, 1)]
+void LumenReflectionDenoiserSpatialCS(
+	uint GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	FReflectionTileData TileData;
+	const uint2 ReflectionScreenCoord = GetReflectionResolveScreenCoord(GroupId, GroupThreadId, TileData);
+
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoord_Reflection(ReflectionScreenCoord, TileData, ClosureIndex);
+
+#if DEBUG_MODE
+	int2 DebugScreenCoord = View.CursorPosition.x >= 0 ? View.CursorPosition * View.ViewResolutionFraction : -1;
+	bool bDebug = all(Coord.SvPosition == DebugScreenCoord);
+	FShaderPrintContext Context = InitShaderPrintContext(true, float2(0.55, 0.7));
+#endif
+
+	float4 CenterSpecularLightingAndSecondMoment = RGBAToDenoiserSpace(SpecularLightingAndSecondMomentTexture[Coord.SvPositionFlatten]);
+	if (IsLightingValidForDenoiser(CenterSpecularLightingAndSecondMoment.xyz))
+	{
+		float CenterSpecularStdDev = sqrt(max(CenterSpecularLightingAndSecondMoment.w - Pow2(Luminance(CenterSpecularLightingAndSecondMoment.xyz)), 0.0f));
+
+		const FLumenMaterialData Material = ApplySmoothBias(ReadMaterialData(Coord, MaxRoughnessToTrace, false/*bAllowStochaticMaterial*/), true /*bTopLayerRoughness*/);
+		float DisocclusionFactor = 0.0f;
+
+		// Run relaxed spatial filter until we accumulate enough frames to rely on temporal variance
+		float NumFramesAccumulated = UnpackNumFramesAccumulated(NumFramesAccumulatedTexture[Coord.SvPositionFlatten]);
+		const uint MaxFramesAccumulated = GetMaxFramesAccumulated(TemporalMaxFramesAccumulated, Material.TopLayerRoughness);
+		if (MaxFramesAccumulated > 1)
+		{
+			//DisocclusionFactor = 1.0f - saturate((NumFramesAccumulated - 1.0f) / min(4.0f, MaxFramesAccumulated - 1.0f));
+			DisocclusionFactor = NumFramesAccumulated > 1 ? 0.0f : 1.0f;
+		}
+
+		float3 SpecularLightingSum = TonemapLighting(CenterSpecularLightingAndSecondMoment.xyz, DisocclusionFactor);
+		float SpecularLightingWeightSum = 1.0f;
+
+		float KernelRadiusInPixels = SpatialFilterKernelRadius * saturate(Material.TopLayerRoughness * 8.0f);
+		uint NumSamples = SpatialFilterNumSamples;
+
+		uint2 RandomSeed = Rand3DPCG16(int3(Coord.SvPosition, ReflectionsStateFrameIndexMod8)).xy;
+
+		float2 ScreenUV = (Coord.SvPosition + 0.5f) * View.BufferSizeAndInvSize.zw;
+		float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, Material.SceneDepth);
+		float4 ScenePlane = float4(Material.WorldNormal, dot(TranslatedWorldPosition, Material.WorldNormal));
+
+		bool bFilterSpecular = CenterSpecularStdDev / max(Luminance(CenterSpecularLightingAndSecondMoment.xyz), 0.1f) > 0.5f || DisocclusionFactor > 0.0f;
+
+		#if SPATIAL_FILTER
+		if (KernelRadiusInPixels > 1.0f && bFilterSpecular)
+		{
+			const float LobeHalfAngle = GetSpecularLobeHalfAngle(Material.TopLayerRoughness) * lerp(1.0f, 2.0f, DisocclusionFactor);
+
+			for (uint NeighborIndex = 0; NeighborIndex < NumSamples; ++NeighborIndex)
+			{
+				float2 NeighborOffsetInRect = Hammersley16(NeighborIndex, NumSamples, RandomSeed);
+				float2 NeighborOffset = UniformSampleDiskConcentric(NeighborOffsetInRect) * KernelRadiusInPixels;
+				int2 NeighborCoord = (int2)(Coord.SvPosition + NeighborOffset);
+
+				if (all(and(NeighborCoord >= View.ViewRectMinAndSize.xy, NeighborCoord < (View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))))
+				{
+					const float2 NeighborScreenUV = (NeighborCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+					const FLumenMaterialCoord NeighborMaterialCoord = GetLumenMaterialCoord(NeighborCoord, Coord.ClosureIndex);
+					const FLumenMaterialData NeighborMaterial = ApplySmoothBias(ReadMaterialData(NeighborMaterialCoord, MaxRoughnessToTrace, false/*bAllowStochaticMaterial*/), true /*bTopLayerRoughness*/);
+
+					// Depth weight
+					const float3 NeighborTranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(NeighborScreenUV, NeighborMaterial.SceneDepth);
+					float PlaneDistance = abs(dot(float4(NeighborTranslatedWorldPosition, -1), ScenePlane));
+					float RelativeDepthDifference = PlaneDistance / Material.SceneDepth;
+					float DepthWeight = exp2(-SpatialFilterDepthWeightScale * (RelativeDepthDifference * RelativeDepthDifference));
+
+					// Normal weight
+					float AngleBetweenNormals = acosFast(saturate(dot(ScenePlane.xyz, NeighborMaterial.WorldNormal)));
+					float NormalWeight = 1.0f - saturate(AngleBetweenNormals / (LobeHalfAngle + 0.01f));
+
+					float3 NeighborSpecularLighting = RGBToDenoiserSpace(SpecularLightingAndSecondMomentTexture[uint3(NeighborCoord, Coord.SvPositionFlatten.z)].xyz);
+					if (IsLightingValidForDenoiser(NeighborSpecularLighting))
+					{
+						float LuminanceDelta = abs(Luminance(CenterSpecularLightingAndSecondMoment.xyz) - Luminance(NeighborSpecularLighting));
+						float LuminanceWeight = exp2(-LuminanceDelta / max(CenterSpecularStdDev, 0.001f));
+
+#if SHADERSHIFT_GRADIENT_REFLECTION_FILTER
+						// Gradient-domain bilateral: scale luminance falloff by
+						// material roughness, so neighbour acceptance widens on rough
+						// surfaces (where blur is fine) and tightens on glossy ones
+						// (where the engine's exp2(-Δ/std) version smears highlights).
+						// CUSTOM_GRAD_REFL_ROUGHNESS_BIAS scales how aggressively
+						// rough surfaces accept neighbours; STRENGTH lerps engine and
+						// gradient-aware weights so users can dial it in.
+						{
+							const float SS_RoughTerm =
+								Material.TopLayerRoughness * CUSTOM_GRAD_REFL_ROUGHNESS_BIAS + 0.0001;
+							const float SS_GradLuminanceWeight =
+								// NOTE: spread is the DENOMINATOR so larger roughness ->
+								// slower falloff -> more neighbours accepted -> more
+								// blur, exactly as the comment above describes.  v1 used
+								// '* SS_RoughTerm' here which INVERTED it (tightened rough
+								// surfaces, smeared glossy ones - the opposite of intent).
+								exp2(-LuminanceDelta / SS_RoughTerm);
+							LuminanceWeight = lerp(
+								LuminanceWeight,
+								SS_GradLuminanceWeight,
+								SSL_KNOB_32(CUSTOM_GRAD_REFL_STRENGTH));
+						}
+#endif // SHADERSHIFT_GRADIENT_REFLECTION_FILTER
+
+						LuminanceWeight = lerp(LuminanceWeight, 1.0f, DisocclusionFactor);
+
+						const float SpecularNeighborWeight = DepthWeight * NormalWeight * LuminanceWeight;
+						SpecularLightingSum += TonemapLighting(NeighborSpecularLighting, DisocclusionFactor) * SpecularNeighborWeight;
+						SpecularLightingWeightSum += SpecularNeighborWeight;
+					}
+				}
+			}
+		}
+		#endif
+
+		float3 SpecularLighting = InverseTonemapLighting(SpecularLightingSum / SpecularLightingWeightSum, DisocclusionFactor);
+
+		#if DEBUG_MODE	
+		if (bDebug)
+		{	
+			Print(Context, TEXT("Spatial"));
+			Newline(Context);
+			Print(Context, TEXT("KernelRadiusInPixels  : "));
+			Print(Context, KernelRadiusInPixels);
+			Newline(Context);
+			Print(Context, TEXT("CenterSpecularStdDev  : "));
+			Print(Context, CenterSpecularStdDev);
+			Newline(Context);
+			Print(Context, TEXT("DisocclusionFactor    : "));
+			Print(Context, DisocclusionFactor);
+			Newline(Context);
+			Print(Context, SpecularLighting);
+			Newline(Context);
+			Print(Context, TEXT("Filter                : "));
+			Print(Context, bFilterSpecular ? 1u : 0u);
+		}
+		#endif
+
+		float4 FinalLighting = float4(DenoiserSpaceToRGB(SpecularLighting), 1.0f);
+
+	#if RAY_TRACED_TRANSLUCENCY
+		if (bCompositeSceneColor != 0)
+		{
+			float3 BackgroundVisibility = BackgroundVisibilityTexture.Load(int3(Coord.SvPosition, 0));
+			float4 SceneColorSample = SceneTexturesStruct.SceneColorTexture.Load(int3(Coord.SvPosition, 0));
+
+			FinalLighting.rgb = SceneColorSample.rgb * BackgroundVisibility + FinalLighting.rgb;
+			FinalLighting.a = SceneColorSample.a * dot(BackgroundVisibility, 1.0f / 3.0f);
+
+			RWTranslucencyLighting[Coord.SvPosition] = FinalLighting;
+		}
+		else
+		{
+			RWTranslucencyLighting[Coord.SvPosition] = FinalLighting;
+		}
+	#else
+		RWSpecularIndirectAccumulated[Coord.SvPositionFlatten] = FinalLighting.xyz;
+	#endif
+	}
+#if RAY_TRACED_TRANSLUCENCY
+	else
+	{
+		float4 ClearValue = float4(0, 0, 0, 1);
+		if (bCompositeSceneColor != 0)
+		{
+			ClearValue = SceneTexturesStruct.SceneColorTexture.Load(int3(Coord.SvPosition, 0));
+		}
+		RWTranslucencyLighting[Coord.SvPosition] = ClearValue;
+	}
+#endif
+}

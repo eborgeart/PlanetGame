@@ -1,0 +1,12 @@
+// Copyright Hyperdyne Systems LLC. All Rights Reserved.
+//
+// DEPRECATED — this file is no longer referenced.
+//
+// The bloom-mode helpers it used to host have been inlined into the two
+// patched engine shaders that actually need them:
+//
+//   PostProcessBloom.usf            — setup-pass kernels (modes 1, 2, 4, 6, 7)
+//   Bloom/BloomResizeKernel.usf     — FFT convolution kernels (modes 3, 5)
+//
+// Each patched file is self-contained and pulls only the helpers required
+// for its dispatcher.  No engine shader includes this header.

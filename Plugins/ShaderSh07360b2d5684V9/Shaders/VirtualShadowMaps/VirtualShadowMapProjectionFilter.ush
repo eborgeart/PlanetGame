@@ -1,0 +1,128 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+VirtualShadowMapProjectionFilter.ush:
+=============================================================================*/
+#pragma once
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "VirtualShadowMapProjectionCommon.ush"
+
+// =========================================================================
+// ShaderShift: Contact-Aware Penumbra Hardening for Virtual Shadow Maps.
+//
+// HONEST DESCRIPTION:
+//
+// The VSM SMRT trace populates FVirtualShadowMapSampleResult::OccluderDistance
+// with the real receiver-to-occluder distance in world units (cm).  This is
+// exactly the input PCSS needs to decide how soft a penumbra should be.
+// When SHADERSHIFT_CONTACT_AWARE_SHADOWS is on, we remap the SMRT-produced
+// partial-occlusion ShadowFactor with a smoothstep whose width is driven by
+// that distance: close occluders -> narrow band -> hard contact; distant
+// occluders -> wide band -> soft penumbra.  The engine's own filter just
+// adds blue noise dither for banding; we run after that so the noise is
+// preserved as a fine inter-pixel dither on the hardened transition.
+//
+// CUSTOM_SHADOW_HARDENING_STRENGTH lerps between the engine-filtered result
+// and the contact-hardened result (0 = engine behaviour, 1 = full hardening).
+//
+// CUSTOM_SHADOW_SOFTNESS_MULTIPLIER scales the world-space distance before
+// the normalisation, letting users tune the "what counts as far enough to be
+// soft" threshold.  Default 1.0 is calibrated for typical interior scales
+// (~1m = full softness).
+//
+// NOTE: this replaces an earlier (broken) implementation that hooked
+// ShadowFilteringCommon.ush::ManualPCF.  That function is the LEGACY CSM /
+// forward-shadowing path and is not called by the VSM projection pipeline,
+// so the toggle had zero effect on VSM-rendered scenes (which is most modern
+// UE5 projects).  The corrected hook lives here on the canonical VSM filter.
+// =========================================================================
+
+#define SHADERSHIFT_CONTACT_AWARE_SHADOWS         0
+
+#define CUSTOM_SHADOW_HARDENING_STRENGTH          0.5
+#define CUSTOM_SHADOW_SOFTNESS_MULTIPLIER         1.0
+
+// === ShaderShift live-tweak macro (editor look-dev; see ShaderShiftRuntimeParams.h) ===
+// Expands inline at the use site (View is bound there).  Packaged builds set
+// SHADERSHIFT_LIVE_TWEAKS 0, collapsing it to the bare compile-time default.
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+// [generated] ShaderShift live-slot decode core (v3 banked) -- Build/gen_live_slots.py.  Do not hand-edit.
+// Focus lane (GeneralPurposeTweak==id) = full-precision knob being dragged now;
+// slot lanes = every dirty knob at 10-bit in the View *OverrideParameter floats
+// (code 1023 = clean -> baked default).  Armed marker = sign bit of BOTH the
+// Specular.x and Normal.x override params -- the only clamp-safe home:
+// SetupCommonViewUniformBufferParameters rewrites Diffuse.yzw + Roughness.y
+// pre-UB.  Mode-exclusive BRDF knobs share bank lanes (diffuse bank 0-16,
+// spec bank 17-20); the control lane (21) carries which diffuse/spec mode owns
+// each bank, so a non-owner knob reads its baked default, never a foreign code.
+#ifndef SSL_ARMED
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_ARMED(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#define SSL_CODE(SYM, MEMBER, LN) ((asuint(SYM.MEMBER) >> ((LN) * 10u)) & 0x3FFu)
+#define SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF) ((SSL_ARMED(SYM) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF))
+#define SSL_CTRL(SYM) SSL_CODE(SYM, NormalOverrideParameter.w, 0u)
+#define SSL_DOWNER(SYM) (SSL_CTRL(SYM) & 0xFu)
+#define SSL_SOWNER(SYM) ((SSL_CTRL(SYM) >> 4u) & 0xFu)
+#define SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF) ((SSL_ARMED(SYM) && (OWN) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF))
+#else
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) (DEF)
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) (DEF)
+#endif
+#endif // SSL_ARMED
+#ifndef SSL_KNOB_41
+#define SSL_KNOB_41(DEF) ((SHADERSHIFT_LIVE_TWEAKS != 0 && round(View.GeneralPurposeTweak) == 41.0) ? View.GeneralPurposeTweak2 : (DEF)) // CUSTOM_SHADOW_HARDENING_STRENGTH [5.7: focus-lane only -- no clamp-safe lane left]
+#endif
+#ifndef SSL_KNOB_42
+#define SSL_KNOB_42(DEF) ((SHADERSHIFT_LIVE_TWEAKS != 0 && round(View.GeneralPurposeTweak) == 42.0) ? View.GeneralPurposeTweak2 : (DEF)) // CUSTOM_SHADOW_SOFTNESS_MULTIPLIER [5.7: focus-lane only -- no clamp-safe lane left]
+#endif
+
+void FilterVirtualShadowMapSampleResult(uint2 PixelPos, inout FVirtualShadowMapSampleResult In)
+{
+	// Add some simple dither to break up banding
+	// This is not perfect for stuff like subsurface stuff in motion, as the banding on those smooth
+	// gradients can be significant and in motion TSR can't get enough samples to average it all out,
+	// but it's inexpensive amd usually pretty reasonable.
+	// Current noise scale aligns with one pass projection packing, but also works well for typical SMRT ray counts
+	// The tolerance on the lower end is somewhat arbitrary, but needed to trade off brightening umbra regions in subsurface
+	// materials (due to adding noise then clamping) against banding in penumbra regions on these surfaces.
+	const float NoiseScale = (1.0f / 15.0f);
+	if (In.ShadowFactor > (NoiseScale/4.0f) && In.ShadowFactor < 1.0f)
+	{
+		In.ShadowFactor += (BlueNoiseScalar(PixelPos, View.StateFrameIndex) - 0.5f) * NoiseScale;
+		In.ShadowFactor = saturate(In.ShadowFactor);
+	}
+
+#if SHADERSHIFT_CONTACT_AWARE_SHADOWS
+	// Run AFTER the engine's noise dither so the per-pixel jitter survives
+	// the remap as fine grain on the hardened transition.  Only act on
+	// partial-occlusion (penumbra) pixels - umbra and full-light are already
+	// at their step-function endpoints and don't need remapping.
+	//
+	// In.OccluderDistance is filled by the SMRT trace.  bValid implies the
+	// SMRT actually hit something; OccluderDistance > 0 guards against
+	// "no occluder" sentinel values (the init writes -1.0f).
+	if (In.bValid && In.OccluderDistance > 0.0f &&
+	    In.ShadowFactor > 0.0f && In.ShadowFactor < 1.0f)
+	{
+		// World units (cm) -> normalised softness in [0,1].
+		// 100 cm = full softness; closer = harder.
+		const float SS_DistNorm = saturate(
+			In.OccluderDistance * (SSL_KNOB_42(CUSTOM_SHADOW_SOFTNESS_MULTIPLIER) * (1.0 / 100.0)));
+
+		// Half-width of the smoothstep transition band, around the partial-
+		// occlusion midpoint.  Narrow (0.05) at contact, wide (0.40) at the
+		// far end - PCSS-style ratio of about 8x.
+		const float SS_HalfWidth = lerp(0.05f, 0.40f, SS_DistNorm);
+		const float SS_Hardened  = smoothstep(0.5f - SS_HalfWidth, 0.5f + SS_HalfWidth, In.ShadowFactor);
+
+		// Lerp the engine-filtered value with the contact-hardened curve.
+		In.ShadowFactor = lerp(In.ShadowFactor, SS_Hardened, SSL_KNOB_41(CUSTOM_SHADOW_HARDENING_STRENGTH));
+	}
+#endif // SHADERSHIFT_CONTACT_AWARE_SHADOWS
+}

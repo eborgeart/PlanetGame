@@ -1,0 +1,1726 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	BRDF.usf: Bidirectional reflectance distribution functions.
+	
+	5.7-compatible version with custom BRDF modes from ShaderOverridePlugin:
+	- Selectable diffuse BRDF modes (Lambert, OrenNayar, Burley)
+	- Multi-lobe specular with cinematic secondary lobe
+=============================================================================*/
+
+#pragma once
+
+
+//=============================================================================
+// Custom BRDF Modes
+//
+// Two independent defines control the custom look:
+//
+// CUSTOM_DIFFUSE_MODE — selects the diffuse model
+//   0 = Engine default (Lambert, or Chan / EON when MATERIAL_ROUGHDIFFUSE is on)
+//   1 = Energy-conserving Oren-Nayar (QON)
+//   2 = Disney Burley diffuse
+//   3 = Lambert-Sphere [d'Eon 2021] — porous Lambertian-sphere model (no roughness)
+//   4 = Gotanda [tri-Ace 2014]      — view-dependent, self-compensating against GGX
+//
+// CUSTOM_SPEC_MODE — selects the specular NDF / visibility
+//   0 = Engine default (single-lobe GGX)
+//   1 = Multi-lobe cinematic specular (sharp primary + soft secondary)
+//
+// These are fully orthogonal — any combination works.  When CUSTOM_SPEC_MODE
+// == 1, the diffuse paths apply per-model dual-lobe energy compensation:
+//   - Burley / QON / Lambert-Sphere / Lambert / Chan: post-multiply by
+//     (1 - E_combined), where E_combined is the analytical Lazarov-based
+//     directional albedo of the two specular lobes blended by their weight.
+//   - EON: pre-shrinks the input albedo to (albedo * (1 - E_combined)) so
+//     EON's internal multiple-scattering compensation re-fits to the reduced
+//     energy budget.
+//   - Gotanda: receives the lobe-blended effective roughness and self-
+//     compensates internally — no external multiply.
+//=============================================================================
+
+#define CUSTOM_DIFFUSE_MODE 2
+#define CUSTOM_SPEC_MODE 1
+
+
+// ---------------------------------------------------------------------------
+// Multi-lobe specular configuration
+// These can be overridden by the project to fine-tune the look.
+// ---------------------------------------------------------------------------
+
+// Weight of the primary (sharp) lobe. The secondary lobe gets (1 - primary weight).
+#define CUSTOM_SPEC_PRIMARY_WEIGHT 0.7
+
+// Roughness scale for the sharp primary lobe (multiplied against material roughness).
+// Values < 1.0 make the primary lobe tighter than the material roughness. Default 0.45
+#define CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE 0.45
+
+// Maximum roughness for the secondary lobe (clamped to avoid extreme blur).
+#define CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE 2.2
+
+
+#define CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS 0.95
+
+
+// ===========================================================================
+// Callisto BRDF parameters  [Jimenez & Petersen, SIGGRAPH 2023]
+//
+// Selected globally by CUSTOM_DIFFUSE_MODE == 5 (Callisto diffuse) and/or
+// CUSTOM_SPEC_MODE == 2 (Callisto Modified Dual GGX).  All values below are
+// the GLOBAL defaults (substituted from Project Settings by ShaderShift).
+// Per-material multipliers arrive separately via the hijacked Specular /
+// Anisotropy / AmbientOcclusion channels (see SubstrateEvaluation patch).
+//
+// NEUTRAL == ENGINE:  with DiffFresnel = Retro = 1, SmoothTerm = 0,
+// DualSpecOpacity = 0 and SpecFresnelFalloff = 1, the Callisto BRDF reduces
+// EXACTLY to Lambert + GGX.  (The paper's panel-default "look" uses other
+// values, e.g. SpecFresnelFalloff 0.5 — expose both as presets.)
+// ===========================================================================
+
+// -- Diffuse Fresnel (c1, first lobe).  Intensity * tint; 1 = neutral. -------
+#define CALLISTO_DIFF_FRESNEL              1.0   // rho_f intensity [0,256]
+#define CALLISTO_DIFF_FRESNEL_FALLOFF     0.75  // n_f  [0,1]  (higher = wider)
+#define CALLISTO_DIFF_FRESNEL_TAN_FALLOFF 0.75  // m_f  [0,1]
+#define CALLISTO_DIFF_FRESNEL_TINT_R      1.0
+#define CALLISTO_DIFF_FRESNEL_TINT_G      1.0
+#define CALLISTO_DIFF_FRESNEL_TINT_B      1.0
+
+// -- Retroreflection (c1, second lobe). -------------------------------------
+#define CALLISTO_RETRO                    1.0   // rho_r intensity [0,256]
+#define CALLISTO_RETRO_FALLOFF            0.75  // n_r  [0,1]
+#define CALLISTO_RETRO_TAN_FALLOFF        0.75  // m_r  [0,1]
+#define CALLISTO_RETRO_TINT_R             1.0
+#define CALLISTO_RETRO_TINT_G             1.0
+#define CALLISTO_RETRO_TINT_B             1.0
+
+// -- Smooth Terminator (c2, multiplies the whole contribution). -------------
+#define CALLISTO_SMOOTH_TERM              0.0   // o intensity [-1,1]; 0 = neutral
+#define CALLISTO_SMOOTH_TERM_LENGTH       0.5   // p [0,1]
+#define CALLISTO_SMOOTH_TERM_TINT_R       1.0
+#define CALLISTO_SMOOTH_TERM_TINT_G       1.0
+#define CALLISTO_SMOOTH_TERM_TINT_B       1.0
+
+// -- Specular Fresnel Falloff (generalized Schlick). 1 = exact Schlick. -----
+#define CALLISTO_SPEC_FRESNEL_FALLOFF     1.0   // n_s [0,1]
+
+// -- Modified Dual GGX specular (CUSTOM_SPEC_MODE == 2). ---------------------
+#define CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE 2.0  // secondary lobe roughness x
+#define CALLISTO_DUAL_SPEC_OPACITY         0.0  // [0,1] weight of 2nd lobe; 0 = single
+
+// -- Proxima diffuse (CUSTOM_DIFFUSE_MODE == 6, diffuse AA). -----------------
+#define CALLISTO_PROXIMA_ALPHA_SCALE       1.0  // scales diffuse roughness
+
+// ===========================================================================
+// Regolith — micrograin dust-layer BRDF  [after Lucas et al., SIGGRAPH Asia
+// 2023 "A Micrograin BSDF Model for the Rendering of Porous Layers" and the
+// 2024 fully-correlated anisotropic follow-up (TOG)].
+//
+// A statistical layer of opaque micrograins (dust/chalk/pollen/patina) over
+// the base material.  Real-time adaptation: the grain-slab visibility
+// collapses to a Beer-Lambert projected-coverage term (grazing angles see
+// more dust), the dust lobe is Lambert plus the 2024 paper's signature
+// opposition retro-surge (V ~= L heiligenschein), and the specular layer
+// blends the base lobe toward a broad grain sheen at the D level.
+//
+// Selected by CUSTOM_DIFFUSE_MODE == 7 (Regolith diffuse) and/or
+// CUSTOM_SPEC_MODE == 3 (Regolith Sheen).  REGOLITH_COVERAGE == 0 reduces
+// BOTH to the engine result exactly.
+// ===========================================================================
+#define REGOLITH_COVERAGE                  0.35 // tau [0,1] filling factor; 0 = engine-exact
+#define REGOLITH_GRAIN_ROUGHNESS           0.6  // sheen lobe roughness [0.05,1]
+#define REGOLITH_RETRO                     0.8  // opposition surge strength [0,2]
+#define REGOLITH_SHEEN                     0.6  // grain spec lobe gain [0,2]; 0 = chalk
+#define REGOLITH_ROUGHNESS_AFFINITY        1.0  // 1 = dust clings to rough surfaces only (previous behavior); 0 = coverage applies flat
+#define REGOLITH_TINT_R                    1.0  // dust albedo target (with TINT_BLEND)
+#define REGOLITH_TINT_G                    1.0
+#define REGOLITH_TINT_B                    1.0
+#define REGOLITH_TINT_BLEND                0.0  // 0 = dust keeps base color, 1 = pure tint
+
+// ===========================================================================
+// ShaderShift live-tweak indirection (editor look-dev).
+// Per-thread mutable mirrors of the baked BRDF tunables above; they DEFAULT to
+// the baked #define (so BRDF.ush is unchanged when nothing overrides them, and
+// in cooked builds).  The View-safe callers (ShadingModels.ush /
+// SubstrateEvaluation.ush) overwrite these each BxDF via
+// ShaderShift_SetLiveBRDFGlobals() so the Quick Panel sliders preview live with
+// no recompile.  BRDF.ush itself NEVER reads View, so it stays safe in no-View
+// includes.
+// ===========================================================================
+static float gSSL_CUSTOM_SPEC_PRIMARY_WEIGHT = CUSTOM_SPEC_PRIMARY_WEIGHT;
+static float gSSL_CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE = CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE;
+static float gSSL_CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE = CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE;
+static float gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS = CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS;
+static float gSSL_CALLISTO_SPEC_FRESNEL_FALLOFF = CALLISTO_SPEC_FRESNEL_FALLOFF;
+static float gSSL_CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE = CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE;
+static float gSSL_CALLISTO_DUAL_SPEC_OPACITY = CALLISTO_DUAL_SPEC_OPACITY;
+static float gSSL_CALLISTO_DIFF_FRESNEL = CALLISTO_DIFF_FRESNEL;
+static float gSSL_CALLISTO_DIFF_FRESNEL_FALLOFF = CALLISTO_DIFF_FRESNEL_FALLOFF;
+static float gSSL_CALLISTO_DIFF_FRESNEL_TAN_FALLOFF = CALLISTO_DIFF_FRESNEL_TAN_FALLOFF;
+static float gSSL_CALLISTO_DIFF_FRESNEL_TINT_R = CALLISTO_DIFF_FRESNEL_TINT_R;
+static float gSSL_CALLISTO_DIFF_FRESNEL_TINT_G = CALLISTO_DIFF_FRESNEL_TINT_G;
+static float gSSL_CALLISTO_DIFF_FRESNEL_TINT_B = CALLISTO_DIFF_FRESNEL_TINT_B;
+static float gSSL_CALLISTO_RETRO = CALLISTO_RETRO;
+static float gSSL_CALLISTO_RETRO_FALLOFF = CALLISTO_RETRO_FALLOFF;
+static float gSSL_CALLISTO_RETRO_TAN_FALLOFF = CALLISTO_RETRO_TAN_FALLOFF;
+static float gSSL_CALLISTO_RETRO_TINT_R = CALLISTO_RETRO_TINT_R;
+static float gSSL_CALLISTO_RETRO_TINT_G = CALLISTO_RETRO_TINT_G;
+static float gSSL_CALLISTO_RETRO_TINT_B = CALLISTO_RETRO_TINT_B;
+static float gSSL_CALLISTO_SMOOTH_TERM = CALLISTO_SMOOTH_TERM;
+static float gSSL_CALLISTO_SMOOTH_TERM_LENGTH = CALLISTO_SMOOTH_TERM_LENGTH;
+static float gSSL_CALLISTO_SMOOTH_TERM_TINT_R = CALLISTO_SMOOTH_TERM_TINT_R;
+static float gSSL_CALLISTO_SMOOTH_TERM_TINT_G = CALLISTO_SMOOTH_TERM_TINT_G;
+static float gSSL_CALLISTO_SMOOTH_TERM_TINT_B = CALLISTO_SMOOTH_TERM_TINT_B;
+static float gSSL_CALLISTO_PROXIMA_ALPHA_SCALE = CALLISTO_PROXIMA_ALPHA_SCALE;
+static float gSSL_REGOLITH_COVERAGE = REGOLITH_COVERAGE;
+static float gSSL_REGOLITH_GRAIN_ROUGHNESS = REGOLITH_GRAIN_ROUGHNESS;
+static float gSSL_REGOLITH_RETRO = REGOLITH_RETRO;
+static float gSSL_REGOLITH_SHEEN = REGOLITH_SHEEN;
+static float gSSL_REGOLITH_ROUGHNESS_AFFINITY = REGOLITH_ROUGHNESS_AFFINITY;
+
+
+// -- Per-material tuning (hijacked channels) global enable. -----------------
+// When 1, the patched SubstrateEvaluation reinterprets Specular -> RhoF mult,
+// Anisotropy -> RhoR mult, AmbientOcclusion -> SmoothTerminator mult, each
+// calibrated so the channel's neutral default decodes to x1.  Materials that
+// keep engine-default Specular(0.5)/Aniso(0)/AO(1) are unaffected.
+#define CALLISTO_PER_MATERIAL_TUNING       0
+
+// -- Per-material BRDF SELECTION global enable. -----------------------------
+// When 1, a per-pixel BRDF "preset" (0..7) is transported from the material via
+// the Callisto BRDF Select node (reserved Substrate BSDF state bits) and the
+// diffuse/specular paths runtime-switch on it.  Preset 0 = no override (the
+// material uses the global CUSTOM_DIFFUSE_MODE/CUSTOM_SPEC_MODE).  Presets:
+//   1=Engine Default, 2=Callisto, 3=Regolith, 4=Burley, 5=Lambert-Sphere,
+//   6=Gotanda, 7=Proxima.  Like the tuning channels, the reserved bits only
+//   survive the Substrate Complex path (sg.ShadingQuality 2).  Default 0 keeps
+//   the compile-time global dispatch (zero cost/permutation change).
+#define CALLISTO_PER_MATERIAL_SELECT       0
+
+// -- Per-material tuning FALLBACK preset (compile time). ---------------------
+// The tuning node's three lanes are interpreted per-PRESET (see the encode in
+// BasePassPixelShader.usf and the decode in SubstrateEvaluation.ush).  When a
+// material has no ShaderShift BRDF Select node at encode time, or carries
+// preset bits 0 at decode time (or selection is globally off), the effective
+// preset falls back to this constant derived from the global modes.  Values
+// match the Select node presets: 2 = Callisto, 3 = Regolith, 7 = Proxima,
+// 0 = none (the lanes are not hijacked and nothing is bound).
+#if CUSTOM_DIFFUSE_MODE == 5
+	#define SHADERSHIFT_TUNING_FALLBACK_PRESET 2
+#elif CUSTOM_DIFFUSE_MODE == 6
+	#define SHADERSHIFT_TUNING_FALLBACK_PRESET 7
+#elif (CUSTOM_DIFFUSE_MODE == 7) || (CUSTOM_SPEC_MODE == 3)
+	#define SHADERSHIFT_TUNING_FALLBACK_PRESET 3
+#else
+	#define SHADERSHIFT_TUNING_FALLBACK_PRESET 0
+#endif
+
+
+struct BxDFContext
+{
+	half NoV;
+	half NoL;
+	half VoL;
+	half NoH;
+	half VoH;
+	half XoV;
+	half XoL;
+	half XoH;
+	half YoV;
+	half YoL;
+	half YoH;
+};
+
+void Init( inout BxDFContext Context, half3 N, half3 V, half3 L )
+{
+	Context.NoL = dot(N, L);
+	Context.NoV = dot(N, V);
+	Context.VoL = dot(V, L);
+	float InvLenH = rsqrt( 2 + 2 * Context.VoL );
+	Context.NoH = saturate( ( Context.NoL + Context.NoV ) * InvLenH );
+	Context.VoH = saturate( InvLenH + InvLenH * Context.VoL );
+	//NoL = saturate( NoL );
+	//NoV = saturate( abs( NoV ) + 1e-5 );
+
+	Context.XoV = 0.0f;
+	Context.XoL = 0.0f;
+	Context.XoH = 0.0f;
+	Context.YoV = 0.0f;
+	Context.YoL = 0.0f;
+	Context.YoH = 0.0f;
+}
+
+void Init( inout BxDFContext Context, half3 N, half3 X, half3 Y, half3 V, half3 L )
+{
+	Context.NoL = dot(N, L);
+	Context.NoV = dot(N, V);
+	Context.VoL = dot(V, L);
+	float InvLenH = rsqrt( 2 + 2 * Context.VoL );
+	Context.NoH = saturate( ( Context.NoL + Context.NoV ) * InvLenH );
+	Context.VoH = saturate( InvLenH + InvLenH * Context.VoL );
+	//NoL = saturate( NoL );
+	//NoV = saturate( abs( NoV ) + 1e-5 );
+
+	Context.XoV = dot(X, V);
+	Context.XoL = dot(X, L);
+	Context.XoH = (Context.XoL + Context.XoV) * InvLenH;
+	Context.YoV = dot(Y, V);
+	Context.YoL = dot(Y, L);
+	Context.YoH = (Context.YoL + Context.YoV) * InvLenH;
+}
+
+void InitMobile(inout BxDFContext Context, half3 N, half3 V, half3 L, half NoL)
+{
+	Context.NoL = NoL;
+	Context.NoV = dot(N, V);
+	Context.VoL = dot(V, L);
+	float3 H = normalize(float3(V + L));
+	Context.NoH = max(0, dot(N, H));
+	Context.VoH = max(0, dot(V, H));
+
+	//NoL = saturate( NoL );
+	//NoV = saturate( abs( NoV ) + 1e-5 );
+
+	Context.XoV = 0.0f;
+	Context.XoL = 0.0f;
+	Context.XoH = 0.0f;
+	Context.YoV = 0.0f;
+	Context.YoL = 0.0f;
+	Context.YoH = 0.0f;
+}
+
+// [ de Carpentier 2017, "Decima Engine: Advances in Lighting and AA" ]
+void SphereMaxNoH( inout BxDFContext Context, float SinAlpha, bool bNewtonIteration )
+{
+	if( SinAlpha > 0 )
+	{
+		float CosAlpha = sqrt( 1 - Pow2( SinAlpha ) );
+	
+		float RoL = 2 * Context.NoL * Context.NoV - Context.VoL;
+		if( RoL >= CosAlpha )
+		{
+			Context.NoH = 1;
+			Context.XoH = 0;
+			Context.YoH = 0;
+			Context.VoH = abs( Context.NoV );
+		}
+		else
+		{
+			float rInvLengthT = SinAlpha * rsqrt( 1 - RoL*RoL );
+			float NoTr = rInvLengthT * ( Context.NoV - RoL * Context.NoL );
+// Enable once anisotropic materials support area lights
+#if 0
+			float XoTr = rInvLengthT * ( Context.XoV - RoL * Context.XoL );
+			float YoTr = rInvLengthT * ( Context.YoV - RoL * Context.YoL );
+#endif
+			float VoTr = rInvLengthT * ( 2 * Context.NoV*Context.NoV - 1 - RoL * Context.VoL );
+
+			if (bNewtonIteration)
+			{
+				// dot( cross(N,L), V )
+				float NxLoV = sqrt( saturate( 1 - Pow2(Context.NoL) - Pow2(Context.NoV) - Pow2(Context.VoL) + 2 * Context.NoL * Context.NoV * Context.VoL ) );
+
+				float NoBr = rInvLengthT * NxLoV;
+				float VoBr = rInvLengthT * NxLoV * 2 * Context.NoV;
+
+				float NoLVTr = Context.NoL * CosAlpha + Context.NoV + NoTr;
+				float VoLVTr = Context.VoL * CosAlpha + 1   + VoTr;
+
+				float p = NoBr   * VoLVTr;
+				float q = NoLVTr * VoLVTr;
+				float s = VoBr   * NoLVTr;
+
+				float xNum = q * ( -0.5 * p + 0.25 * VoBr * NoLVTr );
+				float xDenom = p*p + s * (s - 2*p) + NoLVTr * ( (Context.NoL * CosAlpha + Context.NoV) * Pow2(VoLVTr) + q * (-0.5 * (VoLVTr + Context.VoL * CosAlpha) - 0.5) );
+				float TwoX1 = 2 * xNum / ( Pow2(xDenom) + Pow2(xNum) );
+				float SinTheta = TwoX1 * xDenom;
+				float CosTheta = 1.0 - TwoX1 * xNum;
+				NoTr = CosTheta * NoTr + SinTheta * NoBr;
+				VoTr = CosTheta * VoTr + SinTheta * VoBr;
+			}
+
+			Context.NoL = Context.NoL * CosAlpha + NoTr; // dot( N, L * CosAlpha + T * SinAlpha )
+// Enable once anisotropic materials support area lights
+#if 0
+			Context.XoL = Context.XoL * CosAlpha + XoTr;
+			Context.YoL = Context.YoL * CosAlpha + YoTr;
+#endif
+			Context.VoL = Context.VoL * CosAlpha + VoTr;
+
+#if SUBSTRATE_ENABLED
+			// It seems that VoL can end up out of the [-1, 1] range.
+			// This causes NaN when evaluating the phase function for Substrate SimpleVolume diffuse (sqrt of a negative number is NaN, see HenyeyGreensteinPhase).
+			// So we enforce a valid VoL range here for substrate which does do math when VoL is close to -1 in this case.
+			Context.VoL = clamp(Context.VoL, -1.0, 1.0);
+#endif
+
+			float InvLenH = rsqrt( 2 + 2 * Context.VoL );
+			Context.NoH = saturate( ( Context.NoL + Context.NoV ) * InvLenH );
+// Enable once anisotropic materials support area lights
+#if 0
+			Context.XoH = ((Context.XoL + Context.XoV) * InvLenH);	// dot(X, (L+V)/|L+V|)
+			Context.YoH = ((Context.YoL + Context.YoV) * InvLenH);
+#endif
+			Context.VoH = saturate( InvLenH + InvLenH * Context.VoL );
+		}
+	}
+}
+
+// Physically based shading model
+// parameterized with the below options
+// [ Karis 2013, "Real Shading in Unreal Engine 4" slide 11 ]
+
+// E = Random sample for BRDF.
+// N = Normal of the macro surface.
+// H = Normal of the micro surface.
+// V = View vector going from surface's position towards the view's origin.
+// L = Light ray direction
+
+// D = Microfacet NDF
+// G = Shadowing and masking
+// F = Fresnel
+
+// Vis = G / (4*NoL*NoV)
+// f = Microfacet specular BRDF = D*G*F / (4*NoL*NoV) = D*Vis*F
+
+
+half3 Diffuse_Lambert( half3 DiffuseColor )
+{
+	return DiffuseColor * (1 / PI);
+}
+
+// [Burley 2012, "Physically-Based Shading at Disney"]
+float3 Diffuse_Burley( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH )
+{
+	float FD90 = 0.5 + 2 * VoH * VoH * Roughness;
+	float FdV = 1 + (FD90 - 1) * Pow5( 1 - NoV );
+	float FdL = 1 + (FD90 - 1) * Pow5( 1 - NoL );
+	return DiffuseColor * ( (1 / PI) * FdV * FdL );
+}
+
+// [Gotanda 2012, "Beyond a Simple Physically Based Blinn-Phong Model in Real-Time"]
+float3 Diffuse_OrenNayar( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH )
+{
+	float a = Roughness * Roughness;
+	float s = a;// / ( 1.29 + 0.5 * a );
+	float s2 = s * s;
+	float VoL = 2 * VoH * VoH - 1;		// double angle identity
+	float Cosri = VoL - NoV * NoL;
+	float C1 = 1 - 0.5 * s2 / (s2 + 0.33);
+	float C2 = 0.45 * s2 / (s2 + 0.09) * Cosri * ( Cosri >= 0 ? rcp( max( NoL, NoV ) ) : 1 );
+	return DiffuseColor / PI * ( C1 + C2 ) * ( 1 + Roughness * 0.5 );
+}
+
+// ---------------------------------------------------------------------------
+// Energy-Conserving Oren-Nayar Diffuse
+// Qualitative Oren-Nayar with energy normalization so that a white
+// diffuse surface with Roughness=0 matches Lambert, and higher roughness
+// redistributes energy rather than creating it.
+// References:
+//   [Oren & Nayar 1994] "Generalization of Lambert's reflectance model"
+//   [Fujii 2012]        "A tiny improvement of Oren-Nayar reflectance model"
+// ---------------------------------------------------------------------------
+
+float3 Diffuse_OrenNayarFull( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH )
+{
+	// Compute sigma^2 from artist roughness (perceptual roughness squared)
+	float sigma  = Roughness * Roughness;
+	float sigma2 = sigma * sigma;
+
+	// Reconstruct VoL from VoH via double-angle identity: VoL = 2*VoH^2 - 1
+	float VoL = 2.0 * VoH * VoH - 1.0;
+
+	// Cosri = cos(phi_i - phi_r) projected: VoL - NoV*NoL
+	float Cosri = VoL - NoV * NoL;
+
+	// Oren-Nayar A and B terms
+	float A = 1.0 - 0.5 * (sigma2 / (sigma2 + 0.33));
+	float B = 0.45 * (sigma2 / (sigma2 + 0.09));
+
+	// sin(alpha) * tan(beta) approximation
+	// alpha = max(theta_i, theta_r), beta = min(theta_i, theta_r)
+	float SinNL = sqrt(saturate(1.0 - NoL * NoL));
+	float SinNV = sqrt(saturate(1.0 - NoV * NoV));
+	float MaxCos = saturate(Cosri);
+	float SinAlpha, TanBeta;
+	if (NoL > NoV)
+	{
+		SinAlpha = SinNL;
+		TanBeta  = SinNV / max(NoV, 1e-4);
+	}
+	else
+	{
+		SinAlpha = SinNV;
+		TanBeta  = SinNL / max(NoL, 1e-4);
+	}
+
+	float OrenNayar = A + B * MaxCos * SinAlpha * TanBeta;
+
+	// Energy normalization: the raw Oren-Nayar model gains energy at high roughness.
+	// We apply a roughness-dependent divisor fitted so that a furnace test integrates
+	// to ~1.0 across roughness values. The divisor is: 1 + 0.1175 * sigma2
+	// (Fitted to match hemispherical integral of the A+B model within ~1% error.)
+	float EnergyNorm = rcp(1.0 + 0.1175 * sigma2);
+
+	return DiffuseColor * (1.0 / PI) * OrenNayar * EnergyNorm;
+}
+
+// [Gotanda 2014, "Designing Reflectance Models for New Consoles"]
+float3 Diffuse_Gotanda( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH )
+{
+	float a = Roughness * Roughness;
+	float a2 = a * a;
+	float F0 = 0.04;
+	float VoL = 2 * VoH * VoH - 1;		// double angle identity
+	float Cosri = VoL - NoV * NoL;
+#if 1
+	float a2_13 = a2 + 1.36053;
+	float Fr = ( 1 - ( 0.542026*a2 + 0.303573*a ) / a2_13 ) * ( 1 - pow( 1 - NoV, 5 - 4*a2 ) / a2_13 ) * ( ( -0.733996*a2*a + 1.50912*a2 - 1.16402*a ) * pow( 1 - NoV, 1 + rcp(39*a2*a2+1) ) + 1 );
+	//float Fr = ( 1 - 0.36 * a ) * ( 1 - pow( 1 - NoV, 5 - 4*a2 ) / a2_13 ) * ( -2.5 * Roughness * ( 1 - NoV ) + 1 );
+	float Lm = ( max( 1 - 2*a, 0 ) * ( 1 - Pow5( 1 - NoL ) ) + min( 2*a, 1 ) ) * ( 1 - 0.5*a * (NoL - 1) ) * NoL;
+	float Vd = ( a2 / ( (a2 + 0.09) * (1.31072 + 0.995584 * NoV) ) ) * ( 1 - pow( 1 - NoL, ( 1 - 0.3726732 * NoV * NoV ) / ( 0.188566 + 0.38841 * NoV ) ) );
+	float Bp = Cosri < 0 ? 1.4 * NoV * NoL * Cosri : Cosri;
+	float Lr = (21.0 / 20.0) * (1 - F0) * ( Fr * Lm + Vd + Bp );
+	return DiffuseColor / PI * Lr;
+#else
+	float a2_13 = a2 + 1.36053;
+	float Fr = ( 1 - ( 0.542026*a2 + 0.303573*a ) / a2_13 ) * ( 1 - pow( 1 - NoV, 5 - 4*a2 ) / a2_13 ) * ( ( -0.733996*a2*a + 1.50912*a2 - 1.16402*a ) * pow( 1 - NoV, 1 + rcp(39*a2*a2+1) ) + 1 );
+	float Lm = ( max( 1 - 2*a, 0 ) * ( 1 - Pow5( 1 - NoL ) ) + min( 2*a, 1 ) ) * ( 1 - 0.5*a + 0.5*a * NoL );
+	float Vd = ( a2 / ( (a2 + 0.09) * (1.31072 + 0.995584 * NoV) ) ) * ( 1 - pow( 1 - NoL, ( 1 - 0.3726732 * NoV * NoV ) / ( 0.188566 + 0.38841 * NoV ) ) );
+	float Bp = Cosri < 0 ? 1.4 * NoV * Cosri : Cosri / max( NoL, 1e-8 );
+	float Lr = (21.0 / 20.0) * (1 - F0) * ( Fr * Lm + Vd + Bp );
+	return DiffuseColor / PI * Lr;
+#endif
+}
+
+// [Portsmouth et al. 2025, "EON: A Practical Energy-Preserving Rough Diffuse BRDF"]
+float3 Diffuse_EON( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoL )
+{
+	// Albedo inversion for EON model to maintain a consistent color with lambert
+	float3 Rho = DiffuseColor * (1.0 + (0.189468 - 0.189468 * DiffuseColor) * Roughness);
+
+	// This is the main shaping term from the Oren-Nayar model (with tweaks by Fujii)
+	float S = VoL - NoV * NoL;
+	float SOverT = max(S * rcp(max(1e-6, max(NoV, NoL))), S);
+	const float constant1_FON = 0.5f - 2.0f / (3.0f * PI);
+	// AF = rcp(1 + Roughness * constant1_FON) is nearly a straight line, so approximate it as such
+	float AF = 1 - Roughness * (1 - 1 / (1 + constant1_FON));
+	float f_ss = AF * (1 + Roughness * SOverT);
+
+	// 4th Order approximation from the paper is a bit too heavy, first order seems to work just as well
+	const float g1 = 0.262048f;
+	float GoverPi_V = g1 - g1 * NoV;
+	// Use (1 - Eo) only as a non-reciprocal approach to energy conservation
+	float f_ms = 1.0f - AF * (1 + Roughness * GoverPi_V);
+	// The Rho_ms term from the paper can be approximated as just Rho^2
+	return Rho * (f_ss + Rho * f_ms) * (1.0 / PI);
+}
+
+// ---------------------------------------------------------------------------
+// Lambert-Sphere Diffuse BRDF
+//
+// [d'Eon 2021, "An Analytic BRDF for Materials with Spherical Lambertian
+//  Scatterers" — EGSR 2021]
+//
+// Closed-form analytic BRDF for a porous, maximally-rough surface composed of
+// spherical Lambertian scatterers (chalk, ash, soot, dry pigment, dusty
+// terrain).  Uses a Hapke-style rational approximation to the Chandrasekhar
+// H-function:
+//    H(mu, rho) ≈ (1 + 2*mu) / (1 + 2*mu*sqrt(1 - rho))
+// The H(NoL,rho) * H(NoV,rho) product gives view-dependent retroreflection,
+// and the implicit multiple-scattering boost produces the richer saturation
+// that distinguishes Lambert-Sphere from plain Lambert.
+//
+// Single parameter: particle albedo rho (the diffuse color).
+// No roughness term — the model is inherently fully rough / fully porous.
+// Cost is comparable to Lambert and is real-time appropriate.
+// ---------------------------------------------------------------------------
+float3 Diffuse_LambertSphere( float3 DiffuseColor, float NoL, float NoV )
+{
+	float3 Rho = saturate(DiffuseColor);
+	float3 SqrtOneMinusRho = sqrt(saturate(float3(1.0, 1.0, 1.0) - Rho));
+
+	float MuL = saturate(NoL);
+	float MuV = saturate(NoV);
+
+	// Chandrasekhar H-function, rational approximation.
+	float3 H_L = (1.0 + 2.0 * MuL) / (1.0 + 2.0 * MuL * SqrtOneMinusRho);
+	float3 H_V = (1.0 + 2.0 * MuV) / (1.0 + 2.0 * MuV * SqrtOneMinusRho);
+
+	return (Rho * (1.0 / PI)) * H_L * H_V;
+}
+
+// ---------------------------------------------------------------------------
+// Dual-lobe specular directional albedo helpers
+//
+// When CUSTOM_SPEC_MODE == 1 the specular path emits two GGX lobes (primary +
+// secondary, blended by CUSTOM_SPEC_PRIMARY_WEIGHT).  The diffuse layer needs
+// to know how much of the incoming energy is consumed by specular at the
+// current view angle so it can compensate and stay energy-conserving.
+//
+// We sample Lazarov's analytical GGX directional-albedo approximation (the
+// same formula used by EnvBRDFApproxNonmetal further down this file) once per
+// effective lobe roughness, then lerp with the same primary weight as D_GGX.
+// No precomputed LUT is required.
+//
+// The "effective roughness" of each lobe matches what D_GGX uses internally:
+//    Roughness_primary   = Roughness * CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE
+//    Roughness_secondary = min(Roughness * CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE,
+//                              CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS)
+//
+// NOTE: the engine already applies its own ComputeEnergyPreservation() to the
+// diffuse layer (computed from single-lobe GGX directional albedo).  The
+// (1 - E_combined) scale below is what the action items literally specify and
+// stacks multiplicatively with that engine term — yielding stronger-than-
+// engine-default diffuse darkening at grazing in dual-lobe mode.  This is the
+// intended behaviour: dual-lobe specular consumes more energy than single-
+// lobe at most angles, so additional diffuse attenuation is desired.
+// ---------------------------------------------------------------------------
+// ===========================================================================
+// Callisto BRDF shared helpers  [Jimenez & Petersen, SIGGRAPH 2023, slides 85/90/95/128]
+//
+// All terms are ISOTROPIC — functions of NoH (cos theta_h), VoH (cos theta_d)
+// and NoL (cos theta_i) only.  The paper's "Tangent Falloff" is a second
+// exponent on theta_h / theta_d, NOT a tangent-frame azimuth, so no
+// WorldTangent / anisotropy data is required.  Used by both the diffuse path
+// (Diffuse_GGX_Rough / Diffuse_Ext below) and the patched Substrate specular
+// path (SubstrateEvaluation.ush).
+// ===========================================================================
+
+// Per-material tuning multipliers (per-thread).  Default 1 = neutral (global
+// values only).  The patched SubstrateEvaluation sets these from the hijacked
+// Specular / Anisotropy / AmbientOcclusion channels before evaluating the
+// Callisto diffuse & specular.  On the legacy (non-Substrate) path they stay 1.
+static float gCallistoRhoFMul   = 1.0;
+static float gCallistoRhoRMul   = 1.0;
+static float gCallistoSmoothMul = 1.0;
+
+// Per-material BRDF preset (per-thread).  0 = no override (use global modes);
+// 1..7 select a preset.  The patched SubstrateEvaluation sets this from the
+// reserved Substrate BSDF state bits before evaluating the BRDF.
+static uint gCallistoPreset = 0;
+
+// Accessor for the 3 reserved ("___UNUSED___") bits in the Substrate BSDF state
+// word.  These round-trip for free on the Substrate Complex path (Layout 2
+// packs the full 32-bit state).  Offset = just below WEIGHT10F.  Only expanded
+// in SubstrateEvaluation / BasePassPixelShader, where Substrate.ush is included.
+#define BSDF_GETSHADERSHIFTBITS(X)     READ_BITS( X.State, BSDF_BIT_COUNT___UNUSED___, BSDF_BIT_OFFSET_WEIGHT10F - BSDF_BIT_COUNT___UNUSED___)
+#define BSDF_SETSHADERSHIFTBITS(X, V)  WRITE_BITS(X.State, BSDF_BIT_COUNT___UNUSED___, BSDF_BIT_OFFSET_WEIGHT10F - BSDF_BIT_COUNT___UNUSED___, V)
+
+// Map the per-material preset to an effective diffuse / specular mode.  When
+// selection is off, or preset 0, these collapse to the global modes.
+uint Callisto_EffectiveDiffuseMode()
+{
+#if CALLISTO_PER_MATERIAL_SELECT
+	switch (gCallistoPreset)
+	{
+		case 1: return 0;  // Engine Default
+		case 2: return 5;  // Callisto
+		case 3: return 7;  // Regolith (micrograin dust layer)
+		case 4: return 2;  // Burley
+		case 5: return 3;  // Lambert-Sphere
+		case 6: return 4;  // Gotanda
+		case 7: return 6;  // Proxima
+		default: return CUSTOM_DIFFUSE_MODE;
+	}
+#else
+	return CUSTOM_DIFFUSE_MODE;
+#endif
+}
+uint Callisto_EffectiveSpecMode()
+{
+#if CALLISTO_PER_MATERIAL_SELECT
+	switch (gCallistoPreset)
+	{
+		case 1: return 0;  // Engine GGX
+		case 2: return 2;  // Callisto Modified Dual GGX
+		case 3: return 3;  // Regolith Sheen (dust layer spec)
+		default: return CUSTOM_SPEC_MODE;
+	}
+#else
+	return CUSTOM_SPEC_MODE;
+#endif
+}
+
+// r(x) = 2^(1-x): maps a friendly [0,1] falloff knob to a Schlick-style
+// exponent scale (1 -> exp 5, 0.75 -> ~5.95, 0 -> exp 10).
+float Callisto_rmap(float x) { return exp2(1.0 - x); }
+
+// h(theta,n,phi,m) = max(1-cos theta,0)^(5n) * max(cos phi,0)^(5m)   (slide 85)
+float Callisto_h(float cosTheta, float n, float cosPhi, float m)
+{
+	return pow(max(1.0 - cosTheta, 0.0), 5.0 * n) * pow(max(cosPhi, 0.0), 5.0 * m);
+}
+
+// c1 — Diffuse Fresnel * Retroreflection.  Returns a (tinted) multiplier on
+// the diffuse lobe.  RhoF = RhoR = 1 (white) => c1 == 1 (engine-neutral).
+float3 Callisto_c1(float VoH, float NoH)
+{
+	float aF = Callisto_h(VoH, Callisto_rmap(gSSL_CALLISTO_DIFF_FRESNEL_FALLOFF),
+	                       NoH, Callisto_rmap(gSSL_CALLISTO_DIFF_FRESNEL_TAN_FALLOFF));
+	float aR = Callisto_h(NoH, Callisto_rmap(gSSL_CALLISTO_RETRO_FALLOFF),
+	                       VoH, Callisto_rmap(gSSL_CALLISTO_RETRO_TAN_FALLOFF));
+
+	float3 RhoF = (gSSL_CALLISTO_DIFF_FRESNEL * gCallistoRhoFMul) * float3(gSSL_CALLISTO_DIFF_FRESNEL_TINT_R, gSSL_CALLISTO_DIFF_FRESNEL_TINT_G, gSSL_CALLISTO_DIFF_FRESNEL_TINT_B);
+	float3 RhoR = (gSSL_CALLISTO_RETRO        * gCallistoRhoRMul) * float3(gSSL_CALLISTO_RETRO_TINT_R,        gSSL_CALLISTO_RETRO_TINT_G,        gSSL_CALLISTO_RETRO_TINT_B);
+
+	float3 fresnel = lerp(float3(1.0, 1.0, 1.0), RhoF, aF);
+	float3 retro   = lerp(float3(1.0, 1.0, 1.0), RhoR, aR);
+	return fresnel * retro;
+}
+
+// c2 — Smooth Terminator.  Returns a (tinted) per-incidence multiplier on the
+// whole (diffuse + specular) contribution.  o = 0 => c2 == 1 (engine-neutral).
+// Per-material intensity scaling comes from gCallistoSmoothMul (default 1).
+float3 Callisto_c2(float NoL, float VoH, float NoH)
+{
+	float aS = (1.0 - pow(1.0 - VoH, 3.0)) * (1.0 - pow(1.0 - NoH, 3.0));
+	float s  = smoothstep(0.0, max(aS * gSSL_CALLISTO_SMOOTH_TERM_LENGTH, 1e-4), NoL);
+	float3 O = (gSSL_CALLISTO_SMOOTH_TERM * gCallistoSmoothMul) * float3(gSSL_CALLISTO_SMOOTH_TERM_TINT_R, gSSL_CALLISTO_SMOOTH_TERM_TINT_G, gSSL_CALLISTO_SMOOTH_TERM_TINT_B);
+	// The lerp amount aS*O can exceed 1 (SmoothTerm up to 1 x tint up to 2),
+	// which extrapolates below zero near the terminator where s ~ 0 -- clamp so
+	// the multiplier can darken to black but never produce negative lighting.
+	return max(lerp(float3(1.0, 1.0, 1.0), float3(s, s, s), aS * O), float3(0.0, 0.0, 0.0));
+}
+
+// Specular Fresnel Falloff (slide 95).  n_s = 1 => exact Schlick.
+float3 Callisto_F(float3 F0, float3 F90, float VoH)
+{
+	float rn  = Callisto_rmap(gSSL_CALLISTO_SPEC_FRESNEL_FALLOFF);
+	float amp = saturate(2.0 - rn);
+	return F0 + amp * (F90 - F0) * pow(max(1.0 - VoH, 0.0), 5.0 * rn);
+}
+
+// Proxima diffuse (slide 128).  cosThetaK = -V.L = 1 - 2*VoH^2 (half-vector
+// identity).  DiffAlpha = 0 => Lambert.
+float3 Callisto_Proxima(float3 DiffuseColor, float DiffAlpha, float NoL, float VoH)
+{
+	float ci = max(NoL, 1e-4);
+	float ck = max(1.0 - 2.0 * VoH * VoH, 0.0);        // max(-V.L, 0)
+	float backscatter = DiffAlpha * (-0.55 + 0.19 / ci) * (1.0 - sqrt(ck)) + 1.0;
+	// The -0.55 slope term can drive the factor negative for DiffAlpha > ~2.8
+	// (reachable with Proxima Roughness Scale > ~2.8 at roughness 1) -- clamp
+	// so an aggressive scale darkens to black instead of inverting the lobe.
+	backscatter = max(backscatter, 0.0);
+	return (DiffuseColor / PI) * backscatter;
+}
+
+float SampleSpecularDirectionalAlbedoLazarov( float Roughness, float NoV )
+{
+	// Lazarov 2013 — same coefficients used inside EnvBRDFApproxNonmetal.
+	// Returns the F0=0.04 nonmetal directional albedo (single scalar in [0,1]).
+	const float2 c0 = float2(-1.0, -0.0275);
+	const float2 c1 = float2( 1.0,  0.0425);
+	float2 r = Roughness * c0 + c1;
+	return min(r.x * r.x, exp2(-9.28 * saturate(NoV))) * r.x + r.y;
+}
+
+// ---------------------------------------------------------------------------
+// Regolith material response: how much of the global dust coverage a surface
+// of this roughness can HOLD.  This is what makes Regolith a general BRDF
+// rather than a uniform overlay -- every pixel's own roughness (and therefore
+// the material's roughness map: scratches, wear masks, polish variation)
+// modulates the dust:
+//   * light dust (low tau) settles only where micro-roughness gives it
+//     purchase -- polished chrome sheds it, brick holds it;
+//   * heavy dust (tau -> 1) buries everything, mirrors included.
+// The hold threshold therefore slides DOWN as coverage deepens.
+// tau = 0 keeps the exact-engine neutrality (effective coverage 0 everywhere).
+// ---------------------------------------------------------------------------
+float Regolith_Hold(float Roughness, float Tau)
+{
+	float HoldMin = 0.6 * (1.0 - Tau);
+	return smoothstep(HoldMin * 0.35, max(HoldMin, 1e-3), Roughness);
+}
+
+// Effective per-pixel coverage: the global REGOLITH_COVERAGE knob is the
+// ceiling; the material's roughness decides how much of it this surface keeps.
+float Regolith_EffectiveCoverage(float Roughness)
+{
+	float Tau = saturate(gSSL_REGOLITH_COVERAGE);
+	// Roughness affinity: 1 = dust clings to rough surfaces only (previous
+	// behavior); 0 = coverage applies flat, ignoring the roughness hold gate.
+	return Tau * lerp(1.0, Regolith_Hold(saturate(Roughness), Tau), saturate(gSSL_REGOLITH_ROUGHNESS_AFFINITY));
+}
+
+float CombinedSpecularDirectionalAlbedo( float Roughness, float NoV )
+{
+#if CUSTOM_SPEC_MODE == 1
+	float R_primary   = saturate(Roughness * gSSL_CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE);
+	float R_secondary = min(Roughness * gSSL_CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE,
+	                        (float)gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS);
+
+	float E_primary   = SampleSpecularDirectionalAlbedoLazarov(R_primary,   NoV);
+	float E_secondary = SampleSpecularDirectionalAlbedoLazarov(R_secondary, NoV);
+
+	// Match D_GGX's blend: W1 * primary + (1 - W1) * secondary  ==
+	// lerp(secondary, primary, W1)
+	return lerp(E_secondary, E_primary, (float)gSSL_CUSTOM_SPEC_PRIMARY_WEIGHT);
+#elif CUSTOM_SPEC_MODE == 3
+	// Regolith Sheen: mirror D_GGX_RegolithSheen's blend — base lobe albedo
+	// toward the (Sheen-scaled) grain-lobe albedo by the material-responsive
+	// effective coverage (this pixel's roughness gates the dust).
+	float E_base  = SampleSpecularDirectionalAlbedoLazarov(Roughness, NoV);
+	float E_grain = saturate(gSSL_REGOLITH_SHEEN
+	                * SampleSpecularDirectionalAlbedoLazarov(saturate(gSSL_REGOLITH_GRAIN_ROUGHNESS), NoV));
+	return lerp(E_base, E_grain, Regolith_EffectiveCoverage(Roughness));
+#else
+	// Single-lobe GGX — just return the standard directional albedo.
+	return SampleSpecularDirectionalAlbedoLazarov(Roughness, NoV);
+#endif
+}
+
+// (1 - E_combined) when a custom multi-lobe specular is active, else 1.
+// Used by Burley / QON / Lambert-Sphere — diffuse models that don't internally
+// couple to specular and need an external multiply to stay energy-conserving.
+float DualLobeDiffuseScale( float Roughness, float NoV )
+{
+#if CUSTOM_SPEC_MODE == 1 || CUSTOM_SPEC_MODE == 3
+	float E_combined = saturate(CombinedSpecularDirectionalAlbedo(Roughness, NoV));
+	return 1.0 - E_combined;
+#else
+	return 1.0;
+#endif
+}
+
+// EON-specific: pre-shrink the albedo so EON's internal multiple-scattering
+// compensation re-fits to the reduced energy budget left by the dual-lobe
+// specular layer.  Cleaner than post-multiplying the EON result, which would
+// over-attenuate the multiple-scattering term (per OpenPBR guidance noted in
+// the action items).
+float3 ShrinkAlbedoForDualLobeSpec( float3 DiffuseColor, float Roughness, float NoV )
+{
+#if CUSTOM_SPEC_MODE == 1 || CUSTOM_SPEC_MODE == 3
+	float E_combined = saturate(CombinedSpecularDirectionalAlbedo(Roughness, NoV));
+	return DiffuseColor * (1.0 - E_combined);
+#else
+	return DiffuseColor;
+#endif
+}
+
+// Effective roughness for Gotanda when paired with dual-lobe specular.  The
+// model self-compensates internally for a single GGX lobe; passing the
+// weighted blend of the two lobes' roughnesses gives a good approximation.
+// (For widely separated lobe roughnesses, evaluating Gotanda twice and
+// summing is more accurate but rarely necessary in cinematic spec setups.)
+float GotandaBlendedRoughness( float Roughness )
+{
+#if CUSTOM_SPEC_MODE == 1
+	float R_primary   = saturate(Roughness * gSSL_CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE);
+	float R_secondary = min(Roughness * gSSL_CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE,
+	                        (float)gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS);
+	return lerp(R_secondary, R_primary, (float)gSSL_CUSTOM_SPEC_PRIMARY_WEIGHT);
+#elif CUSTOM_SPEC_MODE == 3
+	// Regolith Sheen: hand Gotanda the effective-coverage-blended roughness
+	// (material-responsive, same gate as the D blend).
+	return lerp(Roughness, saturate(gSSL_REGOLITH_GRAIN_ROUGHNESS), Regolith_EffectiveCoverage(Roughness));
+#else
+	return Roughness;
+#endif
+}
+
+#define ROUGH_DIFFUSE_BRDF_VERSION 2
+
+// Engine-default rough diffuse (EON / Chan), factored so both the compile-time
+// dispatch and the per-material runtime switch can share it.
+float3 Diffuse_EngineDefault( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH, float NoH, float RetroReflectivityWeight, float SpecRoughness )
+{
+#if ROUGH_DIFFUSE_BRDF_VERSION == 3
+	float VoL = 2 * VoH * VoH - 1;
+	float3 EONAlbedo = ShrinkAlbedoForDualLobeSpec(DiffuseColor, SpecRoughness, NoV);
+	return Diffuse_EON(EONAlbedo, RetroReflectivityWeight * Roughness * 0.4, NoV, NoL, VoL);
+#elif ROUGH_DIFFUSE_BRDF_VERSION == 2
+	// [ Chan 2024, "Multiscattering Diffuse and Specular BRDFs" ]
+	Roughness *= RetroReflectivityWeight;
+	const float Alpha = Roughness * Roughness;
+	const float FSmooth = 1;
+	const float Scale = max(0.55 - 0.2 * Roughness, 1.25 - 1.6 * Roughness);
+	const float Bias = saturate(4 * Alpha);
+	const float FRough = Scale * (NoH + Bias) * rcp(NoH + 0.025) * VoH * VoH;
+	const float DiffuseSS = lerp(FSmooth, FRough, Roughness);
+	const float DiffuseMS = Alpha * 0.38;
+	return (1 / PI) * DiffuseColor * (DiffuseSS + DiffuseMS) * DualLobeDiffuseScale(SpecRoughness, NoV);
+#else
+	// [ Chan 2018, "Material Advances in Call of Duty: WWII" ]
+	float a2 = Pow4(Roughness);
+	float g = saturate( (1.0 / 18.0) * log2( 2 * rcpFast(a2) - 1 ) );
+	float F0 = VoH + Pow5( 1 - VoH );
+	float FdV = 1 - 0.75 * Pow5( 1 - NoV );
+	float FdL = 1 - 0.75 * Pow5( 1 - NoL );
+	float Fd = lerp( F0, FdV * FdL, saturate( 2.2 * g - 0.5 ) );
+	float Fb = ( (34.5 * g - 59 ) * g + 24.5 ) * VoH * exp2( -max( 73.2 * g - 21.2, 8.9 ) * sqrtFast( NoH ) );
+	Fb *= RetroReflectivityWeight;
+	float Lobe = min(1.0, (1 / PI) * (Fd + Fb));
+	return DiffuseColor * Lobe * DualLobeDiffuseScale(SpecRoughness, NoV);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Regolith dust-layer diffuse (CUSTOM_DIFFUSE_MODE == 7).
+//
+// T = (1-tau)^(0.5*(1/NoV + 1/NoL)) is the base-surface visibility through the
+// statistical grain slab for the in+out light path (Beer-Lambert projected
+// coverage: grazing directions traverse more grains -- the micrograin papers'
+// core structural behaviour, collapsed to a closed form).  The uncovered
+// fraction returns the FULL engine-default diffuse; the covered fraction
+// returns the dust lobe: Lambert on the (optionally tinted) dust albedo plus
+// the opposition retro-surge (V ~= L) observed on dust in the 2024 paper.
+// tau = 0  =>  T = 1  =>  engine-default diffuse EXACTLY.
+// ---------------------------------------------------------------------------
+float3 Diffuse_Regolith( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH, float NoH, float RetroReflectivityWeight, float SpecRoughness )
+{
+	// Material response: the TRUE (spec) roughness decides how much of the
+	// global coverage this pixel holds -- polished surfaces shed light dust.
+	float Tau = Regolith_EffectiveCoverage(SpecRoughness);
+
+	// Base visibility through the grain slab (both legs of the light path).
+	// cos clamps keep silhouettes stable; exp2/log2 form is cheap and exact
+	// for Tau in [0,1) (pow(0,0)=1 guarded by the Tau=1 saturate below).
+	float SecSum = 0.5 * (1.0 / max(NoV, 0.05) + 1.0 / max(NoL, 0.05));
+	float T = pow(saturate(1.0 - Tau), SecSum);
+
+	// Dust lobe: Lambert + opposition surge.  VoL from the half-vector
+	// identity; the surge peaks when the light sits behind the viewer.
+	float3 DustAlbedo = lerp(DiffuseColor,
+	                         float3(REGOLITH_TINT_R, REGOLITH_TINT_G, REGOLITH_TINT_B),
+	                         saturate(REGOLITH_TINT_BLEND));
+	float VoL = 2.0 * VoH * VoH - 1.0;
+	float Surge = gSSL_REGOLITH_RETRO * Pow4(saturate(VoL));
+	float3 Dust = (DustAlbedo / PI) * (1.0 + Surge);
+
+	// Uncovered fraction keeps the complete engine-default response (Chan
+	// rough-diffuse incl. its dual-lobe energy handling); dust sits ABOVE the
+	// specular layer, so the covered fraction is not spec-energy attenuated.
+	float3 Base = Diffuse_EngineDefault(DiffuseColor, Roughness, NoV, NoL, VoH, NoH, RetroReflectivityWeight, SpecRoughness);
+	return Base * T + Dust * (1.0 - T);
+}
+
+// Diffuse BRDF by mode index (runtime-switchable for per-material selection).
+// dm: 0/else=engine default, 1=Oren-Nayar, 2=Burley, 3=Lambert-Sphere,
+// 4=Gotanda, 5=Callisto, 6=Proxima, 7=Regolith.  Calls the existing per-model
+// helpers (no math duplication).  SpecRoughness is the un-modified material roughness.
+float3 Callisto_DiffuseByMode( uint dm, float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH, float NoH, float RetroReflectivityWeight, float SpecRoughness )
+{
+	if (dm == 1) return Diffuse_OrenNayarFull(DiffuseColor, Roughness, NoV, NoL, VoH) * DualLobeDiffuseScale(SpecRoughness, NoV);
+	if (dm == 2) return Diffuse_Burley(DiffuseColor, Roughness, NoV, NoL, VoH) * DualLobeDiffuseScale(SpecRoughness, NoV);
+	if (dm == 3) return Diffuse_LambertSphere(DiffuseColor, NoL, NoV) * DualLobeDiffuseScale(SpecRoughness, NoV);
+	if (dm == 4) { float GotandaR = GotandaBlendedRoughness(Roughness); return Diffuse_Gotanda(DiffuseColor, GotandaR, NoV, NoL, VoH); }
+	if (dm == 5) return Diffuse_Lambert(DiffuseColor) * Callisto_c1(VoH, NoH) * Callisto_c2(NoL, VoH, NoH) * DualLobeDiffuseScale(SpecRoughness, NoV);
+	if (dm == 6) { float DiffAlpha = Roughness * Roughness * gSSL_CALLISTO_PROXIMA_ALPHA_SCALE; return Callisto_Proxima(DiffuseColor, DiffAlpha, NoL, VoH) * DualLobeDiffuseScale(SpecRoughness, NoV); }
+	if (dm == 7) return Diffuse_Regolith(DiffuseColor, Roughness, NoV, NoL, VoH, NoH, RetroReflectivityWeight, SpecRoughness);
+	return Diffuse_EngineDefault(DiffuseColor, Roughness, NoV, NoL, VoH, NoH, RetroReflectivityWeight, SpecRoughness);
+}
+
+// This models a rough surface that has a GGX NDF where each microfacet has a lambertian response. Various models have been proposed
+// to try and approximate this behavior.
+float3 Diffuse_GGX_Rough( float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH, float NoH, float RetroReflectivityWeight )
+{
+	// We saturate each input to avoid out of range negative values which would result in weird darkening at the edge of meshes (resulting from tangent space interpolation).
+	NoV = saturate(NoV);
+	NoL = saturate(NoL);
+	VoH = saturate(VoH);
+	NoH = saturate(NoH);
+
+	// Cache the un-modified roughness for E_combined lookups — the specular
+	// layer is driven by the original material roughness, not by the
+	// retro-reflection-modified diffuse roughness used below.
+	const float SpecRoughness = Roughness;
+
+#if CUSTOM_DIFFUSE_MODE == 1
+	// Energy-conserving Oren-Nayar (QON) — no internal coupling to specular.
+	return Diffuse_OrenNayarFull(DiffuseColor, Roughness, NoV, NoL, VoH) * DualLobeDiffuseScale(SpecRoughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 2
+	// Disney Burley — has a small Fresnel-adjacent term internally, but for
+	// dual-lobe correctness we apply the external (1 - E_combined) multiply.
+	return Diffuse_Burley(DiffuseColor, Roughness, NoV, NoL, VoH) * DualLobeDiffuseScale(SpecRoughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 3
+	// Lambert-Sphere — view-dependent retroreflection, no roughness input.
+	// External (1 - E_combined) multiply for dual-lobe energy conservation.
+	return Diffuse_LambertSphere(DiffuseColor, NoL, NoV) * DualLobeDiffuseScale(SpecRoughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 4
+	// Gotanda (tri-Ace) — view-dependent and self-compensating against GGX.
+	// In dual-lobe mode we hand it the lobe-weighted blended roughness so its
+	// internal Fresnel-aware coupling re-fits to the broader specular shape.
+	float GotandaR = GotandaBlendedRoughness(Roughness);
+	return Diffuse_Gotanda(DiffuseColor, GotandaR, NoV, NoL, VoH);
+#elif CUSTOM_DIFFUSE_MODE == 5
+	// Callisto [Jimenez & Petersen 2023] — Lambert base shaped by c1 (Diffuse
+	// Fresnel + Retroreflection) and c2 (Smooth Terminator).  DEVIATION FROM
+	// THE PAPER: the paper's c2 is an outer-bracket multiply on the whole
+	// response (diffuse + specular); we fold it into the DIFFUSE ONLY, on both
+	// the legacy and Substrate paths.  Rationale: specular is already killed by
+	// the outer NoL factor at the terminator, so the visual difference is
+	// negligible, and keeping the engine's specular functions untouched avoids
+	// patching every SpecularGGX/DualSpecularGGX/Substrate lobe site.
+	// Neutral params (RhoF=RhoR=1, SmoothTerm=0) => Diffuse_Lambert exactly.
+	return Diffuse_Lambert(DiffuseColor)
+	       * Callisto_c1(VoH, NoH)
+	       * Callisto_c2(NoL, VoH, NoH)
+	       * DualLobeDiffuseScale(SpecRoughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 6
+	// Proxima [Jimenez & Petersen 2023] — roughness-aware diffuse (diffuse AA).
+	// DiffAlpha derived from material roughness (no offline normal-length data
+	// available); at scale 0 reduces to Lambert.
+	float DiffAlpha = Roughness * Roughness * gSSL_CALLISTO_PROXIMA_ALPHA_SCALE;
+	return Callisto_Proxima(DiffuseColor, DiffAlpha, NoL, VoH)
+	       * DualLobeDiffuseScale(SpecRoughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 7
+	// Regolith [after Lucas et al. 2023/2024] — micrograin dust layer over the
+	// engine-default base.  Coverage 0 = engine-exact (T = 1 short-circuits).
+	return Diffuse_Regolith(DiffuseColor, Roughness, NoV, NoL, VoH, NoH, RetroReflectivityWeight, SpecRoughness);
+#else
+		// Engine default fallback paths
+	#if ROUGH_DIFFUSE_BRDF_VERSION == 3
+		// It turns out the EON model in the range [0, 0.4] is nearly a perfect match to a ground truth
+		// simulation of diffuse microfacets oriented with a GGX NDF.
+		float VoL = 2 * VoH * VoH - 1;		// double angle identity to keep signature above consistent with other models
+		// Pre-shrink the albedo so EON's internal multiple-scattering
+		// compensation re-fits to the reduced energy budget left by the
+		// dual-lobe specular layer.  (When CUSTOM_SPEC_MODE == 0 this is a
+		// no-op.)
+		float3 EONAlbedo = ShrinkAlbedoForDualLobeSpec(DiffuseColor, SpecRoughness, NoV);
+		return Diffuse_EON(EONAlbedo, RetroReflectivityWeight * Roughness * 0.4, NoV, NoL, VoL);
+	#elif ROUGH_DIFFUSE_BRDF_VERSION == 2
+		// [ Chan 2024, "Multiscattering Diffuse and Specular BRDFs", Unpublished manuscript ]
+		Roughness *= RetroReflectivityWeight;
+		const float Alpha = Roughness * Roughness;
+		// The original writeup uses an FSmooth term inspired by Burley diffuse to balance energy between spec/diffuse.
+		// However in our implementation the energy balance between diffuse and spec is handled externally, so we stick
+		// to a plain lambertian for the Roughness=0 limit.
+		const float FSmooth = 1;
+		const float Scale = max(0.55 - 0.2 * Roughness, 1.25 - 1.6 * Roughness);
+		const float Bias = saturate(4 * Alpha);
+		const float FRough = Scale * (NoH + Bias) * rcp(NoH + 0.025) * VoH * VoH;
+		const float DiffuseSS = lerp(FSmooth, FRough, Roughness);
+		const float DiffuseMS = Alpha * 0.38;
+		return (1 / PI) * DiffuseColor * (DiffuseSS + DiffuseMS) * DualLobeDiffuseScale(SpecRoughness, NoV);
+	#else
+		// [ Chan 2018, "Material Advances in Call of Duty: WWII" ]
+		// It has been extended here to fade out retro reflectivity contribution from area light in order to avoid visual artefacts.
+		float a2 = Pow4(Roughness);
+		// a2 = 2 / ( 1 + exp2( 18 * g ))
+		float g = saturate( (1.0 / 18.0) * log2( 2 * rcpFast(a2) - 1 ) );
+
+		float F0 = VoH + Pow5( 1 - VoH );
+		float FdV = 1 - 0.75 * Pow5( 1 - NoV );
+		float FdL = 1 - 0.75 * Pow5( 1 - NoL );
+
+		// Rough (F0) to smooth (FdV * FdL) response interpolation
+		float Fd = lerp( F0, FdV * FdL, saturate( 2.2 * g - 0.5 ) );
+
+		// Retro reflectivity contribution.
+		float Fb = ( (34.5 * g - 59 ) * g + 24.5 ) * VoH * exp2( -max( 73.2 * g - 21.2, 8.9 ) * sqrtFast( NoH ) );
+		// It fades out when lights become area lights in order to avoid visual artefacts.
+		Fb *= RetroReflectivityWeight;
+
+		float Lobe = (1 / PI) * (Fd + Fb);
+
+		// We clamp the BRDF lobe value to an arbitrary value of 1 to get some practical benefits at high roughness:
+		// - This is to avoid too bright edges when using normal map on a mesh and the local bases, L, N and V ends up in an top emisphere setup.
+		// - This maintains the full proper rough look of a sphere when not using normal maps.
+		// - This also fixes the furnace test returning too much energy at the edge of a mesh.
+		Lobe = min(1.0, Lobe);
+
+		return DiffuseColor * Lobe * DualLobeDiffuseScale(SpecRoughness, NoV);
+	#endif
+#endif
+}
+
+// [Blinn 1977, "Models of light reflection for computer synthesized pictures"]
+float D_Blinn( float a2, float NoH )
+{
+	float n = 2 / a2 - 2;
+	return (n+2) / (2*PI) * PhongShadingPow( NoH, n );		// 1 mad, 1 exp, 1 mul, 1 log
+}
+
+// [Beckmann 1963, "The scattering of electromagnetic waves from rough surfaces"]
+float D_Beckmann( float a2, float NoH )
+{
+	float NoH2 = NoH * NoH;
+	return exp( (NoH2 - 1) / (a2 * NoH2) ) / ( PI * a2 * NoH2 * NoH2 );
+}
+
+// GGX / Trowbridge-Reitz
+//[Walter et al. 2007, "Microfacet models for refraction through rough surfaces"]
+
+// Engine single-lobe GGX.
+float D_GGX_Engine( float a2, float NoH )
+{
+	float d = ( NoH * a2 - NoH ) * NoH + 1;	// 2 mad
+	return a2 / ( PI*d*d );					// 4 mul, 1 rcp
+}
+// Multi-lobe cinematic (CUSTOM_SPEC_MODE 1).
+float D_GGX_MultiLobe( float a2, float NoH )
+{
+	float Alpha = sqrt(max(a2, 1e-8));
+	float ScaleP = gSSL_CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE;
+	float Alpha_primary = Alpha * (ScaleP * ScaleP);
+	float a2_primary = Alpha_primary * Alpha_primary;
+	float d_primary  = (NoH * a2_primary - NoH) * NoH + 1.0;
+	float D_primary  = a2_primary / (PI * d_primary * d_primary);
+
+	float ScaleS = gSSL_CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE;
+	float MaxAlpha = gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS * gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS;
+	float Alpha_secondary = min(Alpha * (ScaleS * ScaleS), MaxAlpha);
+	float a2_secondary = Alpha_secondary * Alpha_secondary;
+	float d_secondary  = (NoH * a2_secondary - NoH) * NoH + 1.0;
+	float D_secondary  = a2_secondary / (PI * d_secondary * d_secondary);
+
+	float W1 = gSSL_CUSTOM_SPEC_PRIMARY_WEIGHT;
+	return W1 * D_primary + (1.0 - W1) * D_secondary;
+}
+// Regolith Sheen (CUSTOM_SPEC_MODE 3): base lobe blended toward a broad,
+// isotropic grain-sheen lobe at REGOLITH_GRAIN_ROUGHNESS, by coverage.
+// Sheen gain 0 kills the covered fraction's gloss entirely (chalk); coverage
+// 0 == engine GGX exactly.  The view/light-dependent coverage dynamics live
+// in Diffuse_Regolith (no NoV/NoL at the D level).
+float D_GGX_RegolithSheen( float a2, float NoH )
+{
+	float dB = (NoH * a2 - NoH) * NoH + 1.0;
+	float DB = a2 / (PI * dB * dB);
+
+	float AlphaG = gSSL_REGOLITH_GRAIN_ROUGHNESS * gSSL_REGOLITH_GRAIN_ROUGHNESS;
+	float a2G    = AlphaG * AlphaG;
+	float dG     = (NoH * a2G - NoH) * NoH + 1.0;
+	float DG     = a2G / (PI * dG * dG);
+
+	// Material response: recover linear roughness from a2 (= R^4) so this
+	// pixel's own roughness gates the dust exactly as in the diffuse layer.
+	float TauEff = Regolith_EffectiveCoverage(pow(max(a2, 1e-8), 0.25));
+	return lerp(DB, gSSL_REGOLITH_SHEEN * DG, TauEff);
+}
+
+// Callisto Modified Dual GGX (CUSTOM_SPEC_MODE 2): primary at material
+// roughness, secondary at roughness*DualSpecRoughnessScale, blended by opacity.
+// Opacity 0 => single lobe == engine GGX.
+float D_GGX_CallistoDual( float a2, float NoH )
+{
+	float dP   = (NoH * a2 - NoH) * NoH + 1.0;
+	float DP   = a2 / (PI * dP * dP);
+
+	float AlphaC      = sqrt(max(a2, 1e-8));
+	float AlphaSecond = AlphaC * gSSL_CALLISTO_DUAL_SPEC_ROUGHNESS_SCALE;
+	float a2S         = AlphaSecond * AlphaSecond;
+	float dS          = (NoH * a2S - NoH) * NoH + 1.0;
+	float DS          = a2S / (PI * dS * dS);
+
+	return lerp(DP, DS, gSSL_CALLISTO_DUAL_SPEC_OPACITY);
+}
+
+float D_GGX( float a2, float NoH )
+{
+#if CALLISTO_PER_MATERIAL_SELECT
+	uint sm = Callisto_EffectiveSpecMode();
+	if (sm == 1) return D_GGX_MultiLobe(a2, NoH);
+	if (sm == 2) return D_GGX_CallistoDual(a2, NoH);
+	if (sm == 3) return D_GGX_RegolithSheen(a2, NoH);
+	return D_GGX_Engine(a2, NoH);
+#elif CUSTOM_SPEC_MODE == 1
+	return D_GGX_MultiLobe(a2, NoH);
+#elif CUSTOM_SPEC_MODE == 2
+	return D_GGX_CallistoDual(a2, NoH);
+#elif CUSTOM_SPEC_MODE == 3
+	return D_GGX_RegolithSheen(a2, NoH);
+#else
+	return D_GGX_Engine(a2, NoH);
+#endif
+}
+
+// Anisotropic GGX
+//[Burley 2012, "Physically-Based Shading at Disney"]
+float D_GGXaniso( float ax, float ay, float NoH, float XoH, float YoH )
+{
+#if CUSTOM_SPEC_MODE == 1
+	// ax and ay are already Alpha (Roughness^2)
+	float ScaleP = gSSL_CUSTOM_SPEC_PRIMARY_ROUGHNESS_SCALE;
+	float PrimaryScaleSq = ScaleP * ScaleP;
+	float axP = max(ax * PrimaryScaleSq, 0.001);
+	float ayP = max(ay * PrimaryScaleSq, 0.001);
+	float a2P = axP * ayP;
+	float3 VP = float3(ayP * XoH, axP * YoH, a2P * NoH);
+	float SP = dot(VP, VP);
+	float D_primary = (1.0 / PI) * a2P * Square(a2P / SP);
+
+	// Secondary lobe (wider)
+	float ScaleS = gSSL_CUSTOM_SPEC_SECONDARY_ROUGHNESS_SCALE;
+	float SecondaryScaleSq = ScaleS * ScaleS;
+	float MaxAlpha = gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS * gSSL_CUSTOM_SPEC_SECONDARY_MAX_ROUGHNESS;
+	float axS = min(ax * SecondaryScaleSq, MaxAlpha);
+	float ayS = min(ay * SecondaryScaleSq, MaxAlpha);
+	float a2S = axS * ayS;
+	float3 VS = float3(ayS * XoH, axS * YoH, a2S * NoH);
+	float SS = dot(VS, VS);
+	float D_secondary = (1.0 / PI) * a2S * Square(a2S / SS);
+
+	float W1 = gSSL_CUSTOM_SPEC_PRIMARY_WEIGHT;
+	float W2 = 1.0 - W1;
+	return W1 * D_primary + W2 * D_secondary;
+#elif CUSTOM_SPEC_MODE == 3
+	// Regolith Sheen: anisotropic base lobe blended toward the isotropic grain
+	// sheen (dust grains have no tangent alignment).  Coverage 0 = engine.
+	float a2B = ax * ay;
+	float3 VB = float3(ay * XoH, ax * YoH, a2B * NoH);
+	float SB = dot(VB, VB);
+	float D_base = (1.0f / PI) * a2B * Square(a2B / SB);
+
+	float AlphaG = gSSL_REGOLITH_GRAIN_ROUGHNESS * gSSL_REGOLITH_GRAIN_ROUGHNESS;
+	float a2G    = AlphaG * AlphaG;
+	float dG     = (NoH * a2G - NoH) * NoH + 1.0;
+	float D_grain = a2G / (PI * dG * dG);
+
+	// Material response: mean linear roughness from the anisotropic alphas.
+	float TauEffA = Regolith_EffectiveCoverage(pow(max(ax * ay, 1e-8), 0.25));
+	return lerp(D_base, gSSL_REGOLITH_SHEEN * D_grain, TauEffA);
+#else
+	// The two formulations are mathematically equivalent
+	#if 1
+		float a2 = ax * ay;
+		float3 V = float3(ay * XoH, ax * YoH, a2 * NoH);
+		float S = dot(V, V);
+
+		return (1.0f / PI) * a2 * Square(a2 / S);
+	#else
+		float d = XoH*XoH / (ax*ax) + YoH*YoH / (ay*ay) + NoH*NoH;
+		return 1.0f / ( PI * ax*ay * d*d );
+	#endif
+#endif
+}
+
+float Vis_Implicit()
+{
+	return 0.25;
+}
+
+// [Neumann et al. 1999, "Compact metallic reflectance models"]
+float Vis_Neumann( float NoV, float NoL )
+{
+	return 1 / ( 4 * max( NoL, NoV ) );
+}
+
+// [Kelemen 2001, "A microfacet based coupled specular-matte brdf model with importance sampling"]
+float Vis_Kelemen( float VoH )
+{
+	// constant to prevent NaN
+	return rcp( 4 * VoH * VoH + 1e-5);
+}
+
+// Tuned to match behavior of Vis_Smith
+// [Schlick 1994, "An Inexpensive BRDF Model for Physically-Based Rendering"]
+float Vis_Schlick( float a2, float NoV, float NoL )
+{
+	float k = sqrt(a2) * 0.5;
+	float Vis_SchlickV = NoV * (1 - k) + k;
+	float Vis_SchlickL = NoL * (1 - k) + k;
+	return 0.25 / ( Vis_SchlickV * Vis_SchlickL );
+}
+
+// Smith term for GGX
+// [Smith 1967, "Geometrical shadowing of a random rough surface"]
+float Vis_Smith( float a2, float NoV, float NoL )
+{
+	float Vis_SmithV = NoV + sqrt( NoV * (NoV - NoV * a2) + a2 );
+	float Vis_SmithL = NoL + sqrt( NoL * (NoL - NoL * a2) + a2 );
+	return rcp( Vis_SmithV * Vis_SmithL );
+}
+
+// Appoximation of joint Smith term for GGX
+// [Heitz 2014, "Understanding the Masking-Shadowing Function in Microfacet-Based BRDFs"]
+float Vis_SmithJointApprox( float a2, float NoV, float NoL )
+{
+	float a = sqrt(a2);
+	float Vis_SmithV = NoL * ( NoV * ( 1 - a ) + a );
+	float Vis_SmithL = NoV * ( NoL * ( 1 - a ) + a );
+	return 0.5 * rcp( Vis_SmithV + Vis_SmithL );
+}
+
+// [Heitz 2014, "Understanding the Masking-Shadowing Function in Microfacet-Based BRDFs"]
+float Vis_SmithJoint(float a2, float NoV, float NoL) 
+{
+	float Vis_SmithV = NoL * sqrt(NoV * (NoV - NoV * a2) + a2);
+	float Vis_SmithL = NoV * sqrt(NoL * (NoL - NoL * a2) + a2);
+	return 0.5 * rcp(Vis_SmithV + Vis_SmithL);
+}
+
+// [Heitz 2014, "Understanding the Masking-Shadowing Function in Microfacet-Based BRDFs"]
+float Vis_SmithJointAniso(float ax, float ay, float NoV, float NoL, float XoV, float XoL, float YoV, float YoL)
+{
+	float Vis_SmithV = NoL * length(float3(ax * XoV, ay * YoV, NoV));
+	float Vis_SmithL = NoV * length(float3(ax * XoL, ay * YoL, NoL));
+	return 0.5 * rcp(Vis_SmithV + Vis_SmithL);
+}
+
+float3 F_None( float3 SpecularColor )
+{
+	return SpecularColor;
+}
+
+// [Schlick 1994, "An Inexpensive BRDF Model for Physically-Based Rendering"]
+float3 F_Schlick( float3 SpecularColor, float VoH )
+{
+	float Fc = Pow5( 1 - VoH );					// 1 sub, 3 mul
+	//return Fc + (1 - Fc) * SpecularColor;		// 1 add, 3 mad
+	
+	// Anything less than 2% is physically impossible and is instead considered to be shadowing
+	return saturate( 50.0 * SpecularColor.g ) * Fc + (1 - Fc) * SpecularColor;
+}
+
+float3 F_Schlick(float3 F0, float3 F90, float VoH)
+{
+	float Fc = Pow5(1 - VoH);
+	return F90 * Fc + (1 - Fc) * F0;
+}
+
+// ShaderShift: legacy counterpart of SubstrateEvaluation's Substrate_F_GGX --
+// routes the specular Fresnel through Callisto_F when the Callisto Modified
+// Dual GGX specular (CUSTOM_SPEC_MODE == 2) is active, so the Spec Fresnel
+// Falloff knob (CALLISTO_SPEC_FRESNEL_FALLOFF) behaves identically on the
+// legacy and Substrate paths.  Preserves the engine's single-argument
+// F_Schlick convention F90 = saturate(50 * F0.g) (dielectric micro-occlusion:
+// anything under 2% reflectance is treated as shadowing).  n_s = 1 makes
+// Callisto_F the exact Schlick response, so the neutral default matches the
+// engine bit-for-bit in behaviour; with the mode off this compiles straight
+// to the stock F_Schlick call.
+float3 ShaderShift_F_GGX( float3 SpecularColor, float VoH )
+{
+#if CALLISTO_PER_MATERIAL_SELECT
+	if (Callisto_EffectiveSpecMode() == 2)
+	{
+		return Callisto_F(SpecularColor, saturate(50.0 * SpecularColor.g).xxx, VoH);
+	}
+	return F_Schlick(SpecularColor, VoH);
+#elif CUSTOM_SPEC_MODE == 2
+	return Callisto_F(SpecularColor, saturate(50.0 * SpecularColor.g).xxx, VoH);
+#else
+	return F_Schlick(SpecularColor, VoH);
+#endif
+}
+
+float3 F_AdobeF82(float3 F0, float3 F82, float VoH)
+{
+	// [Kutz et al. 2021, "Novel aspects of the Adobe Standard Material" ]
+	// See Section 2.3 (note the formulas in the paper do not match the code, the code is the correct version)
+	// The constants below are derived by just constant folding the terms dependent on CosThetaMax=1/7
+	const float Fc = Pow5(1 - VoH);
+	const float K = 49.0 / 46656.0;
+	float3 b = (K - K * F82) * (7776.0 + 9031.0 * F0);
+	return saturate(F0 + Fc * ((1 - F0) - b * (VoH - VoH * VoH)));
+}
+
+float3 F_Fresnel( float3 SpecularColor, float VoH )
+{
+	float3 SpecularColorSqrt = sqrt( clamp(SpecularColor, float3(0, 0, 0), float3(0.99, 0.99, 0.99) ) );
+	float3 n = ( 1 + SpecularColorSqrt ) / ( 1 - SpecularColorSqrt );
+	float3 g = sqrt( n*n + VoH*VoH - 1 );
+	return 0.5 * Square( (g - VoH) / (g + VoH) ) * ( 1 + Square( ((g+VoH)*VoH - 1) / ((g-VoH)*VoH + 1) ) );
+}
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+	#define SharedSheenLTCSampler	View.SharedBilinearClampedSampler
+#else
+	#define SharedSheenLTCSampler	InSheenSampler
+#endif
+
+float4 SheenLTC_Cofficients(float NoV, float Roughness, Texture2D InSheenLTCTexture, SamplerState InSheenSampler)
+{
+#if 1
+	const float Alpha = sqrt(Roughness);
+	const float SatNoV = saturate(abs(NoV) + 1e-5);
+	float2 UV = float2(Alpha, SatNoV);
+	UV = UV * (31.0 / 32.0) + (0.5 / 32.0);
+	return InSheenLTCTexture.SampleLevel(SharedSheenLTCSampler, UV, 0);
+#else
+	// Sheen model LUT approximation with ALU under the MaterialX TPS.
+	// SUBSTRATE_TODO: measure if this is worth it on some platforms.
+	float x = saturate(abs(NoV) + 1e-5);
+	float y = sqrt(Roughness);
+
+	float A = ((2.58126 * x + 0.813703 * y) * y) / (1.0 + 0.310327 * x * x + 2.60994 * x * y);
+	float B = sqrt(1.0 - x) * (y - 1.0) * y * y * y / (0.0000254053 + 1.71228 * x - 1.71506 * x * y + 1.34174 * y * y);
+
+	float s = y * (0.0206607 + 1.58491 * y) / (0.0379424 + y * (1.32227 + y));
+	float m = y * (-0.193854 + y * (-1.14885 + y * (1.7932 - 0.95943 * y * y))) / (0.046391 + y);
+	float o = y * (0.000654023 + (-0.0207818 + 0.119681 * y) * y) / (1.26264 + y * (-1.92021 + y));
+	float R = exp(-0.5 * Square((x - m) / s)) / (s * sqrt(2.0 * PI)) + o;
+
+	return float4(A, B, R, 0.0f);
+#endif
+}
+
+float SheenLTC_DirectionalAlbedo(float NoV, float Roughness, Texture2D InSheenLTCTexture, SamplerState InSheenSampler)
+{
+	return SheenLTC_Cofficients(NoV, Roughness, InSheenLTCTexture, InSheenSampler).z;
+}
+
+// [Zeltner et al. 2022, "Practical Multiple-Scattering Sheen Using Linearly Transformed Cosines"]
+float3 SheenLTC_Sample(float3 CosSample, float3 V, half3 N, float NoV, float Roughness, Texture2D InSheenLTCTexture, SamplerState InSheenSampler)
+{
+	const float4 LTC = SheenLTC_Cofficients(NoV, Roughness, InSheenLTCTexture, InSheenSampler);
+	const float aInv = LTC.x;
+	const float bInv = LTC.y;
+	// NOTE: The vector is scaled by aInv compared to the reference implementation to avoid unecessary divides
+	const float3 LocalL = normalize(float3(CosSample.x - CosSample.z * bInv, CosSample.y, aInv * CosSample.z));
+
+	// Rotate L into tangent space
+	const float3 T1 = normalize(V - N * NoV);
+	const float3 T2 = cross(N, T1);
+	const float3x3 TangentBasis = float3x3(T1, T2, N);
+	const float3 S = mul(LocalL, TangentBasis);
+	return S;
+}
+
+// [Zeltner et al. 2022, "Practical Multiple-Scattering Sheen Using Linearly Transformed Cosines"]
+// The "OutDirectionalAlbedo" should be multiplied by the result (it is kept separate because in the sampling case it needs to be only included in the weight, not the pdf)
+float SheenLTC_Eval(float3 V, float3 L, half3 N, float NoV, float Roughness, Texture2D InSheenLTCTexture, SamplerState InSheenSampler, inout float OutDirectionalAlbedo)
+{
+	// Rotate L into tangent space
+	const float3 T1 = normalize(V - N * NoV);
+	const float3 T2 = cross(N, T1);
+	const float3x3 TangentBasis = float3x3(T1, T2, N);
+
+	// L' = mul(L, InvT) 
+	// Since TangentBasis is orthnormal Inv(T)=Transpose(T), i.e., mul(L, transpose(T)), which is equivalent to mul(T,L)
+	const float3 LocalL = mul(TangentBasis, L); 
+
+	const float4 LTC = SheenLTC_Cofficients(NoV, Roughness, InSheenLTCTexture, InSheenSampler);
+	const float aInv = LTC.x;
+	const float bInv = LTC.y;
+	OutDirectionalAlbedo = LTC.z;
+
+	float3 WrappedLocalL = float3(
+		aInv * LocalL.x + bInv * LocalL.z,
+		aInv * LocalL.y,
+		LocalL.z);
+
+	const float InvLenWrappedLocalL2 = rcp(length2(WrappedLocalL));
+	// Jabobian is defined as: det(InvLTC) / ||InvLTC . L||
+	// Jacobian should be aInv^2/Length^3 but since we skip the normalization
+	// we end up with aInv^2/Length^4 which is cheaper to compute
+	const float Jacobian = Pow2(aInv * InvLenWrappedLocalL2);
+
+
+	// Evaluation a normalized cos distribution (note: WrappedLocalL was not normalized, we folded the extra length division into the Jacobian)
+	const float CosDistribution = WrappedLocalL.z / PI;
+	const float Out = CosDistribution * Jacobian;
+
+	return max(Out, 0.f);
+}
+
+//---------------
+// EnvBRDF
+//---------------
+void ModifyGGXAnisotropicNormalRoughness(float3 WorldTangent, float Anisotropy, inout float Roughness, inout float3 N, float3 V)
+{
+	if (abs(Anisotropy) > 0.0f)
+	{
+		float3 X = WorldTangent;
+		float3 Y = normalize(cross(N, X));
+
+		float3 AnisotropicDir = Anisotropy >= 0.0f ? Y : X;
+		float3 AnisotropicT   = cross(AnisotropicDir, V); 
+		float3 AnisotropicN   = cross(AnisotropicT, AnisotropicDir);
+
+		float AnisotropicStretch = abs(Anisotropy) * saturate(5.0f * Roughness);
+		N = normalize(lerp(N, AnisotropicN, AnisotropicStretch));
+#if 0
+		Roughness *= saturate(1.2f - abs(Anisotropy));
+#endif
+	}
+}
+
+// Convert a roughness and an anisotropy factor into GGX alpha values respectively for the major and minor axis of the tangent frame
+void GetAnisotropicRoughness(float Alpha, float Anisotropy, out float ax, out float ay)
+{
+#if 1
+	// Anisotropic parameters: ax and ay are the roughness along the tangent and bitangent	
+	// Kulla 2017, "Revisiting Physically Based Shading at Imageworks"
+	ax = max(Alpha * (1.0 + Anisotropy), 0.001f);
+	ay = max(Alpha * (1.0 - Anisotropy), 0.001f);
+#else
+	float K = sqrt(1.0f - 0.95f * Anisotropy);
+	ax = max(Alpha / K, 0.001f);
+	ay = max(Alpha * K, 0.001f);
+#endif
+}
+
+// Convert a roughness and an anisotropy factor, into two roughnesses respectively for the major and minor axis of the tangent frame
+float2 GetAnisotropicRoughness(float Roughness, float Anisotropy)
+{
+	// Anisotropic parameters: ax and ay are the roughness along the tangent and bitangent	
+	// Kulla 2017, "Revisiting Physically Based Shading at Imageworks"
+	float2 Out = saturate(Roughness);
+	Anisotropy = clamp(Anisotropy, -1.0, 1.0);
+	Out.x = max(Roughness * sqrt(1.0 + Anisotropy), 0.001f);
+	Out.y = max(Roughness * sqrt(1.0 - Anisotropy), 0.001f);
+	return Out;
+}
+
+// Return anisotropy factor (+1: Tangent is major axis, -1: Bitangent is the major axis), and the original roughness
+void GetAnisotropicFactor(float RoughnessX, float RoughnessY, inout float Anisotropy, inout float OriginalRoughness)
+{
+	const float MinRoughness = 0.001f;
+	float r = Pow2(max(RoughnessX, MinRoughness) / max(RoughnessY, MinRoughness));
+	Anisotropy = (r - 1.0) / (r + 1.0);
+	OriginalRoughness = (RoughnessX + RoughnessY) / (sqrt(1.0 + Anisotropy) + sqrt(1.0 - Anisotropy));
+}
+
+#ifndef PreIntegratedGF
+Texture2D		PreIntegratedGF;
+SamplerState	PreIntegratedGFSampler;
+#endif
+
+// [Karis 2013, "Real Shading in Unreal Engine 4" slide 11]
+half3 EnvBRDF( half3 SpecularColor, half Roughness, half NoV )
+{
+	// Importance sampled preintegrated G * F
+	float2 AB = Texture2DSampleLevel( PreIntegratedGF, PreIntegratedGFSampler, float2( NoV, Roughness ), 0 ).rg;
+
+	// Anything less than 2% is physically impossible and is instead considered to be shadowing 
+	float3 GF = SpecularColor * AB.x + saturate( 50.0 * SpecularColor.g ) * AB.y;
+	return GF;
+}
+
+half3 EnvBRDF(half3 F0, half3 F90, half Roughness, half NoV)
+{
+	// Importance sampled preintegrated G * F
+	float2 AB = Texture2DSampleLevel(PreIntegratedGF, PreIntegratedGFSampler, float2(NoV, Roughness), 0).rg;
+	float3 GF = F0 * AB.x + F90 * AB.y;
+	return GF;
+}
+
+half2 EnvBRDFApproxLazarov(half Roughness, half NoV)
+{
+	// [ Lazarov 2013, "Getting More Physical in Call of Duty: Black Ops II" ]
+	// Adaptation to fit our G term.
+	const half4 c0 = { -1, -0.0275, -0.572, 0.022 };
+	const half4 c1 = { 1, 0.0425, 1.04, -0.04 };
+	half4 r = Roughness * c0 + c1;
+	half a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+	half2 AB = half2(-1.04, 1.04) * a004 + r.zw;
+	return AB;
+}
+
+half3 EnvBRDFApprox( half3 SpecularColor, half Roughness, half NoV )
+{
+	half2 AB = EnvBRDFApproxLazarov(Roughness, NoV);
+
+	// Anything less than 2% is physically impossible and is instead considered to be shadowing
+	// Note: this is needed for the 'specular' show flag to work, since it uses a SpecularColor of 0
+	float F90 = saturate( 50.0 * SpecularColor.g );
+
+	return SpecularColor * AB.x + F90 * AB.y;
+}
+
+half3 EnvBRDFApprox(half3 F0, half3 F90, half Roughness, half NoV)
+{
+	half2 AB = EnvBRDFApproxLazarov(Roughness, NoV);
+	return F0 * AB.x + F90 * AB.y;
+}
+
+half EnvBRDFApproxNonmetal( half Roughness, half NoV )
+{
+	// Same as EnvBRDFApprox( 0.04, Roughness, NoV )
+	const half2 c0 = { -1, -0.0275 };
+	const half2 c1 = { 1, 0.0425 };
+	half2 r = Roughness * c0 + c1;
+	return min( r.x * r.x, exp2( -9.28 * NoV ) ) * r.x + r.y;
+}
+
+void EnvBRDFApproxFullyRough(inout half3 DiffuseColor, inout half3 SpecularColor)
+{
+	// Factors derived from EnvBRDFApprox( SpecularColor, 1, 1 ) == SpecularColor * 0.4524 - 0.0024
+	DiffuseColor += SpecularColor * 0.45;
+	SpecularColor = 0;
+	// We do not modify Roughness here as this is done differently at different places.
+}
+void EnvBRDFApproxFullyRough(inout half3 DiffuseColor, inout half SpecularColor)
+{
+	DiffuseColor += SpecularColor * 0.45;
+	SpecularColor = 0;
+}
+void EnvBRDFApproxFullyRough(inout half3 DiffuseColor, inout half3 F0, inout half3 F90)
+{
+	DiffuseColor += F0 * 0.45;
+	F0 = F90 = 0;
+}
+
+
+float D_InvBlinn( float a2, float NoH )
+{
+	float A = 4;
+	float Cos2h = NoH * NoH;
+	float Sin2h = 1 - Cos2h;
+	//return rcp( PI * (1 + A*m2) ) * ( 1 + A * ClampedPow( Sin2h, 1 / m2 - 1 ) );
+	return rcp( PI * (1 + A*a2) ) * ( 1 + A * exp( -Cos2h / a2 ) );
+}
+
+float D_InvBeckmann( float a2, float NoH )
+{
+	float A = 4;
+	float Cos2h = NoH * NoH;
+	float Sin2h = 1 - Cos2h;
+	float Sin4h = Sin2h * Sin2h;
+	return rcp( PI * (1 + A*a2) * Sin4h ) * ( Sin4h + A * exp( -Cos2h / (a2 * Sin2h) ) );
+}
+
+float D_InvGGX( float a2, float NoH )
+{
+	float A = 4;
+	float d = ( NoH - a2 * NoH ) * NoH + a2;
+	return rcp( PI * (1 + A*a2) ) * ( 1 + 4 * a2*a2 / ( d*d ) );
+}
+
+float Vis_Cloth( float NoV, float NoL )
+{
+	return rcp( 4 * ( NoL + NoV - NoL * NoV ) );
+}
+
+float D_Charlie(float Roughness, float NoH)
+{
+	float InvR = 1 / Roughness;
+	float Cos2H = NoH * NoH;
+	float Sin2H = 1 - Cos2H;
+	return (2 + InvR) * pow(Sin2H, InvR * 0.5) / (2 * PI);
+}
+
+// [Estevez and Kulla 2017, "Production Friendly Microfacet Sheen BRDF"]
+float Vis_Charlie_L(float x, float r)
+{
+	r = saturate(r);
+	r = 1.0 - (1. - r) * (1. - r);
+
+	float a = lerp(25.3245 , 21.5473 , r);
+	float b = lerp( 3.32435,  3.82987, r);
+	float c = lerp( 0.16801,  0.19823, r);
+	float d = lerp(-1.27393, -1.97760, r);
+	float e = lerp(-4.85967, -4.32054, r);
+
+	return a * rcp( (1 + b * pow(x, c)) + d * x + e);
+}
+float Vis_Charlie(float Roughness, float NoV, float NoL)
+{
+	float VisV = NoV < 0.5 ? exp(Vis_Charlie_L(NoV, Roughness)) : exp(2 * Vis_Charlie_L(0.5, Roughness) - Vis_Charlie_L(1 - NoV, Roughness));
+	float VisL = NoL < 0.5 ? exp(Vis_Charlie_L(NoL, Roughness)) : exp(2 * Vis_Charlie_L(0.5, Roughness) - Vis_Charlie_L(1 - NoL, Roughness));
+
+	return rcp(((1 + VisV + VisL) * (4 * NoV * NoL)));
+}
+
+float Vis_Ashikhmin(float NoV, float NoL)
+{
+	return rcp(4 * (NoL + NoV - NoL * NoV));
+}
+
+// Special medium transmittance evaluation for the clear coat BSDF.
+float3 SimpleClearCoatTransmittance(float NoL, float NoV, float Metallic, float3 BaseColor)
+{
+	float3 Transmittance = 1.0;
+
+	float ClearCoatCoverage = Metallic;
+	if (ClearCoatCoverage > 0.0)
+	{
+		float LayerThickness = 1.0;	// Assume a normalized thickness
+
+		// The path length inside the medium is from light to bottom surface, then back from bottom surface to the viewer.
+		// This assuming an infinite and flat medium slab.
+		float ThinDistance = LayerThickness * (rcp(NoV) + rcp(NoL));
+
+		// BaseColor represents reflected color viewed at 0 incidence angle for the view and light direction... 
+		float3 TransmittanceColor = Diffuse_Lambert(BaseColor);
+		// ... and after being affected by the substrate transmittance when traveling through it, back and forth.
+		// Because of this, extinction is normalized by traveling through layer thickness twice
+		float3 ExtinctionCoefficient = -log(max(TransmittanceColor,0.0001)) / (2.0 * LayerThickness);
+
+		// Optical depth is evaluated for ThinDistance computed above. But we also subtract 2.0 * LayerThickness
+		// in order to respect the fact that BaseColor represents reflected color viewed at 0 incidence angle. => In this case, OpticalDepth will be 0 and thus Transmittance=1.
+		float3 OpticalDepth = ExtinctionCoefficient * max(ThinDistance - 2.0 * LayerThickness, 0.0);
+
+		// Compute transmittance as a fonction of OpticalDepth
+		Transmittance = exp(-OpticalDepth);
+		// And as a fucntion of the ClearCoatCoverage.
+		Transmittance = lerp(1.0, Transmittance, ClearCoatCoverage);
+	}
+
+	// Note: this is a really special way to handle clear coat transmittance.
+	//  - The basecolor of the bottom layer is used as the transmittance color.
+	//	- So basically, a colored metal as bottom layer will look even more saturated at grazing angle.
+	//	- Transmittance is only computed for metals, for some reason plastic do not receive transmittance.
+
+	return Transmittance;
+}
+
+// Conversion of GGX roughness to Beckmann roughness
+// Using Microfacet Distribution Function: To Change or Not to Change, That Is the Question.
+float ConvertRoughnessGGXToBeckmann(float Roughness)
+{
+	// Use a custom remapping to better match the overall highlight shape, in particular for lower roughness (i.e., <0.5). 
+	// The original mapping was Ctr=Roughness based on the paper
+	const float Ctr = pow(Roughness, 0.7f);
+	return saturate(0.8388 * Ctr+ 0.7 * Pow4(Ctr));
+}
+float2 ConvertRoughnessGGXToBeckmann(float2 Roughness)
+{
+	return float2(ConvertRoughnessGGXToBeckmann(Roughness.x), ConvertRoughnessGGXToBeckmann(Roughness.y));
+}
+
+struct FBeckmannDesc
+{
+	float2 Roughness;	// Roughness
+	float2 Alpha;		// Roughness squared
+	float2 Sigma;		// RMS slope of the microfacets
+	float  Rho;			// Slope correlation factor to be used with LEAN mapping. See http://igg.unistra.fr/People/chermain/assets/pdf/Chermain2021RealTime.pdf.
+};
+FBeckmannDesc GGXToBeckmann(float2 GGXSafeRoughness)
+{
+	const float InvSqrt2 = 0.707106f;
+
+	FBeckmannDesc Out;
+	Out.Roughness	= ConvertRoughnessGGXToBeckmann(GGXSafeRoughness);
+	Out.Alpha		= Square(Out.Roughness);
+	Out.Sigma		= Out.Alpha * InvSqrt2;
+	Out.Rho			= 0.0f;
+	return Out;
+}
+
+// --- Diffuse wrapper for Legacy paths --------------------------------------
+//
+// Used by every non-MATERIAL_ROUGHDIFFUSE path (SimpleShading, ClothBxDF,
+// SubsurfaceProfileBxDF, etc.).  The full set of CUSTOM_DIFFUSE_MODE options
+// is mirrored here so the user-selected diffuse model is consistent across
+// the entire engine, not only the rough-diffuse path.
+//
+// Dual-lobe specular compensation is applied per-model exactly as in
+// Diffuse_GGX_Rough so the two paths agree on energy conservation.
+float3 Diffuse_Ext(float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH)
+{
+#if CUSTOM_DIFFUSE_MODE == 1
+	return Diffuse_OrenNayarFull(DiffuseColor, Roughness, NoV, NoL, VoH) * DualLobeDiffuseScale(Roughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 2
+	return Diffuse_Burley(DiffuseColor, Roughness, NoV, NoL, VoH) * DualLobeDiffuseScale(Roughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 3
+	// Lambert-Sphere — view-dependent, no roughness needed.
+	return Diffuse_LambertSphere(DiffuseColor, NoL, NoV) * DualLobeDiffuseScale(Roughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 4
+	// Gotanda — self-compensating, fed lobe-blended roughness in dual-lobe mode.
+	float GotandaR = GotandaBlendedRoughness(Roughness);
+	return Diffuse_Gotanda(DiffuseColor, GotandaR, NoV, NoL, VoH);
+#elif CUSTOM_DIFFUSE_MODE == 5
+	// Callisto — reconstruct NoH from the half-vector identity NoH = (NoL+NoV)/(2*VoH).
+	float NoH5 = saturate((NoL + NoV) / (2.0 * max(VoH, 1e-4)));
+	return Diffuse_Lambert(DiffuseColor)
+	       * Callisto_c1(VoH, NoH5)
+	       * Callisto_c2(NoL, VoH, NoH5)
+	       * DualLobeDiffuseScale(Roughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 6
+	// Proxima diffuse (AA).
+	float DiffAlpha6 = Roughness * Roughness * gSSL_CALLISTO_PROXIMA_ALPHA_SCALE;
+	return Callisto_Proxima(DiffuseColor, DiffAlpha6, NoL, VoH) * DualLobeDiffuseScale(Roughness, NoV);
+#elif CUSTOM_DIFFUSE_MODE == 7
+	// Regolith dust layer — NoH reconstructed from the half-vector identity
+	// (same approach as the Callisto branch above).
+	float NoH7 = saturate((NoL + NoV) / (2.0 * max(VoH, 1e-4)));
+	return Diffuse_Regolith(DiffuseColor, Roughness, NoV, NoL, VoH, NoH7, 1.0, Roughness);
+#else
+	// Engine-default Lambert.  Apply external compensation when the user has
+	// dual-lobe specular active so the furnace test stays correct even with
+	// the default diffuse model.
+	return Diffuse_Lambert(DiffuseColor) * DualLobeDiffuseScale(Roughness, NoV);
+#endif
+}

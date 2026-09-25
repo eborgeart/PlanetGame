@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "{C2250D1E-4381-4B81-597C-F39DE4B26EB0}",
+	"EngineAssociation": "{ABCDFB6F-40EB-1882-5E3A-9AB61DCE50F3}",
 	"Category": "",
 	"Description": "",
 	"Modules": [
@@ -120,7 +120,7 @@
 		},
 		{
 			"Name": "ScreenSpaceFogScattering",
-			"Enabled": true,
+			"Enabled": false,
 			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/260929cfa39b43238302154c98311fc7"
 		},
 		{

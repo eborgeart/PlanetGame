@@ -1,0 +1,1482 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SHADERSHIFT MODIFIED -- adds Screen Space Indirect Lighting with Visibility
+// Bitmask (SSILVB) as a drop-in replacement for the engine's SSGI ray-cast
+// path.  Gated by CUSTOM_SSGI_MODE; when 0 this file compiles to byte-
+// equivalent output of the stock UE 5.7 shader.  See the "ShaderShift SSGI
+// Modes" block below for the algorithm and the dispatch site inside MainCS.
+//
+// NOTE: only the DIFFUSE_TERM path of this shader supports SSILVB GI.  The
+// SPECULAR_TERM path (Lumen-disabled SSR) is left untouched -- SSILVB is
+// a diffuse irradiance technique.
+//
+// This shader runs only when r.SSGI.Enable=1 AND Lumen GI is disabled
+// (r.DynamicGlobalIlluminationMethod=0 or 2).  With Lumen GI enabled the
+// engine takes a different code path; the SSILVB hook here has no effect.
+
+// SHADERSHIFT: SSGI method selector.  Replaced at apply-time by the plugin's
+// BuildFinalSource() with the user's ECustomSSGIMode value.
+//   0 = Engine Default (stochastic SSRT ray cast, unchanged)
+//   1 = SSILVB (Visibility-Bitmask Indirect Diffuse + AO)
+//   2 = Diagnostic (magenta tint -- verify the hook reaches the GPU)
+//   3 = Stable SSGI (engine ray cast with frame-stable sample directions
+//                    and step offsets -- TSR/TAA can lock onto the result
+//                    instead of rejecting the per-frame Hammersley shuffle)
+#define CUSTOM_SSGI_MODE 0
+
+// SHADERSHIFT: per-lane supersampling multiplier for Stable SSGI (Mode 3)
+// AND SSILVB (Mode 1).  Replaced at apply-time by the plugin's
+// BuildFinalSource() with the user's ECustomSSGIQuality value.
+//   Mode 3: each lane casts MULTIPLIER Hammersley rays instead of one.
+//   Mode 1: each lane traces MULTIPLIER hemisphere slices drawn from a fan
+//           of CONFIG_RAY_COUNT * MULTIPLIER azimuths.
+// Each lane writes the mean to LDS so the tile-local bilateral denoiser
+// keeps working unchanged.  Default 1 = no supersample.
+//   1 = x1 (baseline)
+//   2 = x2 (~sqrt(2) less noise)
+//   4 = x4 (half the noise)
+//   8 = x8 (smoothest, linear cost)
+#define CUSTOM_SSGI_RAY_MULTIPLIER 1
+
+// SHADERSHIFT: SSILVB indirect-diffuse tunables (consumed only when
+// CUSTOM_SSGI_MODE == 1).  These are plain compile-time #defines -- edit the
+// values here, or wire them to UShaderShiftSettings float properties via the
+// CUSTOM_* float-tunable table in ShaderShift.cpp (the same mechanism that
+// drives CUSTOM_TAA_CLAMP_FACTOR etc.).  BuildFinalSource() rewrites only the
+// value token and preserves the trailing comment, so the "#define NAME value"
+// shape must be kept intact.  All distances are in world units (UE = cm).
+//
+//   RADIUS      : the SSILVB gather extent ("r" in the paper), expressed as a
+//                 world distance at the receiver depth; it sets how far the
+//                 slice marches across the screen (projected to pixels).  For
+//                 room/box-scale GI this MUST be large enough to reach the
+//                 surrounding walls -- too small and a pixel only samples its
+//                 own coplanar surface and gathers almost nothing (this was the
+//                 root cause of the near-black interior: at 300 only ~5% of the
+//                 hemisphere registered).  There is intentionally NO hard
+//                 world-distance cull (the paper attenuates via the thickness
+//                 model, not a falloff), so RADIUS bounds the on-screen march,
+//                 not which hits are allowed to contribute.
+#define CUSTOM_SSGI_RADIUS 700.0
+//   THICKNESS   : constant assumed world-space thickness of each depth sample
+//                 ("t" in the paper / "hitThickness"), in cm.  This is the core
+//                 SSILVB knob and is what attenuates contribution over distance
+//                 (replacing a falloff): a sample occludes a wedge t deep behind
+//                 its front face, letting light pass *behind* thinner surfaces.
+//                 It is a real-object scale (tens of cm), independent of the
+//                 screen-march RADIUS.  Smaller -> brighter / more leak; larger
+//                 -> darker / GTAO-like over-occlusion.
+#define CUSTOM_SSGI_THICKNESS 40.0
+//   INTENSITY   : main brightness knob on the gathered indirect diffuse.
+//                 The slice estimator is normalised in TraceSlice by pi/2 so
+//                 that a uniform-radiance surround integrates to the same
+//                 value the engine's stock cosine-sampled SSGI reports --
+//                 INTENSITY 1.0 == engine-parity brightness.  SSILVB still
+//                 reads a touch dimmer than stock on real scenes because it
+//                 weights every emitter by its foreshortening cosine
+//                 (n_j.-l), which stock SSGI ignores; default 2.0 compensates
+//                 tastefully.  Tune ~1-4.  Very high values risk an
+//                 over-bright multi-bounce feedback loop via the prev-frame
+//                 colour buffer this pass samples.
+#define CUSTOM_SSGI_INTENSITY 2.0
+//   THICKNESS_DISTANCE : optional linear growth of thickness with view depth
+//                 (paper 3.1) to counter far-field over-thinness.  Effective
+//                 thickness = THICKNESS * (1 + depth_metres * THICKNESS_DISTANCE).
+//                 0 = constant world thickness (default).
+#define CUSTOM_SSGI_THICKNESS_DISTANCE 0.0
+//   MAX_SCREEN_FRACTION : upper clamp on the on-screen march, as a fraction of
+//                 viewport height (resolution independent).  Bounds per-sample
+//                 bandwidth when RADIUS projects very large up close.  ~0.6 lets
+//                 a pixel reach most of the visible room; lower trades reach for
+//                 performance.  (Replaces the old absolute-pixel clamp, which at
+//                 192 px also starved the gather on higher-res viewports.)
+#define CUSTOM_SSGI_MAX_SCREEN_FRACTION 0.6
+//   AO_STRENGTH : how much occlusion this GI pass contributes.  UE feeds this
+//                 pass's AO output into the diffuse-indirect composite, where it
+//                 attenuates skylight/ambient.  SSILVB reports heavy occlusion
+//                 inside concave geometry (e.g. a room/box), so driving AO at
+//                 full strength here crushes the ambient fill to black -- which
+//                 reads as a dark interior even though the GI gather is working.
+//                 0 = this pass emits neutral AO (=1) and contributes GI colour
+//                 only (let the dedicated SSILVB AO pass own occlusion); 1 =
+//                 full SSILVB directional AO from this pass as well.
+#define CUSTOM_SSGI_AO_STRENGTH 0.0
+
+// === ShaderShift live-tweak macro (editor look-dev; see ShaderShiftRuntimeParams.h) ===
+// Expands inline at the use site (View is bound there).  Packaged builds set
+// SHADERSHIFT_LIVE_TWEAKS 0, collapsing it to the bare compile-time default.
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+// [generated] ShaderShift live-slot decode core (v3 banked) -- Build/gen_live_slots.py.  Do not hand-edit.
+// Focus lane (GeneralPurposeTweak==id) = full-precision knob being dragged now;
+// slot lanes = every dirty knob at 10-bit in the View *OverrideParameter floats
+// (code 1023 = clean -> baked default).  Armed marker = sign bit of BOTH the
+// Specular.x and Normal.x override params -- the only clamp-safe home:
+// SetupCommonViewUniformBufferParameters rewrites Diffuse.yzw + Roughness.y
+// pre-UB.  Mode-exclusive BRDF knobs share bank lanes (diffuse bank 0-16,
+// spec bank 17-20); the control lane (21) carries which diffuse/spec mode owns
+// each bank, so a non-owner knob reads its baked default, never a foreign code.
+#ifndef SSL_ARMED
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_ARMED(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#define SSL_CODE(SYM, MEMBER, LN) ((asuint(SYM.MEMBER) >> ((LN) * 10u)) & 0x3FFu)
+#define SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF) ((SSL_ARMED(SYM) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF))
+#define SSL_CTRL(SYM) SSL_CODE(SYM, NormalOverrideParameter.w, 0u)
+#define SSL_DOWNER(SYM) (SSL_CTRL(SYM) & 0xFu)
+#define SSL_SOWNER(SYM) ((SSL_CTRL(SYM) >> 4u) & 0xFu)
+#define SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF) ((SSL_ARMED(SYM) && (OWN) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF))
+#else
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) (DEF)
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) (DEF)
+#endif
+#endif // SSL_ARMED
+#ifndef SSL_KNOB_30
+#define SSL_KNOB_30(DEF) SSL_KNOB(View, 30.0, AmbientOcclusionOverrideParameter.x, 0u, 0.0, 20.0, DEF) // CUSTOM_SSGI_INTENSITY [lane 30]
+#endif
+
+// Generate vector truncation warnings to errors.
+#pragma warning(error: 3206)
+
+//------------------------------------------------------- ENUM VALUES
+
+#define CASTING_PASS_STANDALONE 0
+#define CASTING_PASS_PROBE_OCCLUSION 1
+
+#define DIFFUSE_TERM 0
+#define SPECULAR_TERM 1
+
+
+//------------------------------------------------------- CONFIGS
+
+#define DEBUG_SSRT 0
+#define DEBUG_RAY_COUNT 0
+
+
+#define CONFIG_LDS_STORE_VIEW_N 1
+
+#if QUALITY == 1
+	#define CONFIG_RAY_STEPS 8
+	#define CONFIG_RAY_COUNT 4
+
+#elif QUALITY == 2
+	#define CONFIG_RAY_STEPS 8
+	#define CONFIG_RAY_COUNT 8
+
+#elif QUALITY == 3
+	#define CONFIG_RAY_STEPS 8
+	#define CONFIG_RAY_COUNT 16
+
+#elif QUALITY == 4
+	#define CONFIG_RAY_STEPS 12
+	#define CONFIG_RAY_COUNT 32
+
+#else
+	#error Unknown Quality.
+#endif
+
+#if CONFIG_RAY_COUNT == 4
+	#define TILE_PIXEL_SIZE_X 8
+	#define TILE_PIXEL_SIZE_X_LOG 3
+
+	#define TILE_PIXEL_SIZE_Y 8
+	#define TILE_PIXEL_SIZE_Y_LOG 3
+
+#elif CONFIG_RAY_COUNT == 8
+	#define TILE_PIXEL_SIZE_X 8
+	#define TILE_PIXEL_SIZE_X_LOG 3
+
+	#define TILE_PIXEL_SIZE_Y 4
+	#define TILE_PIXEL_SIZE_Y_LOG 2
+
+#elif CONFIG_RAY_COUNT == 16
+	#define TILE_PIXEL_SIZE_X 4
+	#define TILE_PIXEL_SIZE_X_LOG 2
+
+	#define TILE_PIXEL_SIZE_Y 4
+	#define TILE_PIXEL_SIZE_Y_LOG 2
+
+#elif CONFIG_RAY_COUNT == 32
+	#define TILE_PIXEL_SIZE_X 4
+	#define TILE_PIXEL_SIZE_X_LOG 2
+
+	#define TILE_PIXEL_SIZE_Y 2
+	#define TILE_PIXEL_SIZE_Y_LOG 1
+
+#else
+	#error Unknown Quality.
+#endif
+
+
+#if CONFIG_RAY_COUNT > 1
+#define CONFIG_KARIS_WEIGHTING 1
+#else
+#define CONFIG_KARIS_WEIGHTING 0
+#endif
+
+
+//------------------------------------------------------- CONFIG DISABLED DEFAULTS
+
+#ifndef CONFIG_LDS_STORE_VIEW_N
+	#define CONFIG_LDS_STORE_VIEW_N 0
+#endif
+
+
+
+
+#define TILE_PIXEL_COUNT (TILE_PIXEL_SIZE_X * TILE_PIXEL_SIZE_Y)
+#define LANE_PER_GROUPS (TILE_PIXEL_COUNT * CONFIG_RAY_COUNT)
+		
+
+
+//------------------------------------------------------- INCLUDES
+
+#if DIM_LIGHTING_TERM == DIFFUSE_TERM
+#define IS_SSGI_SHADER 1
+#endif
+
+#include "SSRTRayCast.ush"
+#include "SSRTTileClassificationBuffer.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../Random.ush"
+#include "../BRDF.ush"
+#include "../MonteCarlo.ush"
+#include "../SceneTextureParameters.ush"
+#include "../Substrate/Substrate.ush"
+#include "../HZB.ush"
+// NOTE: BlueNoise.ush was tried for STBN-driven jitter, but the SSRT render
+// pass (FSSRDiffuseIndirectCS in C++) does NOT bind the BlueNoise uniform
+// buffer in its shader parameter struct -- only Lumen passes do.  Including
+// BlueNoise.ush here causes a runtime UB-slot binding mismatch crash.
+// Wiring it up needs C++ changes (FSSRDiffuseIndirectCS::FParameters needs
+// a BlueNoise UB ref + the render-graph pass needs to receive it), which is
+// outside the shader-patch-only budget.  We fall back to Rand3DPCG16 below.
+
+//------------------------------------------------------- PARAMETERS
+
+uint bRejectUncertainRays;
+
+Texture2D<float> ProbeOcclusionDistanceTexture;
+
+Texture2D ColorTexture;
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+#define ColorTextureSampler GlobalPointClampedSampler
+#else
+SamplerState ColorTextureSampler;
+#endif
+
+float4 ColorBufferScaleBias;
+float2 ReducedColorUVMax;
+
+float PixelPositionToFullResPixel;
+float2 FullResPixelOffset;
+
+RWTexture2D<float4>	IndirectDiffuseOutput;
+RWTexture2D<float>	AmbientOcclusionOutput;
+
+RWTexture2D<float4> DebugOutput;
+
+
+//------------------------------------------------------- LDS
+
+groupshared uint SharedMemory0[LANE_PER_GROUPS * 2];
+groupshared uint SharedMemory1[LANE_PER_GROUPS];
+
+
+//------------------------------------------------------- FUNCTIONS
+
+#if LANE_PER_GROUPS == 64 && 0
+	#undef GroupMemoryBarrierWithGroupSync
+	#define GroupMemoryBarrierWithGroupSync()
+#endif
+
+uint CompressN(float3 N)
+{
+	// matches 8bits GBuffer A to be lossless.
+	uint3 K = uint3(saturate(N * 0.5 + 0.5) * 255.0);
+	return uint(K.x << 0 | K.y << 8 | K.z << 16);
+}
+
+float3 DecompressN(uint EncodedN)
+{
+	uint3 K;
+	K.x = (EncodedN >>  0) & 0xFF;
+	K.y = (EncodedN >>  8) & 0xFF;
+	K.z = (EncodedN >> 16) & 0xFF;
+
+	return float3(K) * (2.0 / 255.0) - 1.0;
+}
+
+uint2 DecodeGroupPixelOffset(uint GroupPixelId)
+{
+    return uint2(GroupPixelId % TILE_PIXEL_SIZE_X, (GroupPixelId >> TILE_PIXEL_SIZE_X_LOG) % TILE_PIXEL_SIZE_Y);
+}
+
+uint EncodeGroupPixelOffset(uint2 GroupPixelOffset)
+{
+	return GroupPixelOffset.x | (GroupPixelOffset.y << TILE_PIXEL_SIZE_X_LOG);
+}
+
+uint2 ComputePixelPosition(uint2 GroupId, uint2 GroupPixelOffset)
+{
+    return GroupId * uint2(TILE_PIXEL_SIZE_X, TILE_PIXEL_SIZE_Y) + GroupPixelOffset;
+}
+
+void UpdateLane2DCoordinateInformations(
+	uint2 PixelPosition,
+	inout float2 BufferUV,
+	inout float2 ScreenPos,
+	inout float2 FullResPixelPosition)
+{
+	FullResPixelPosition = PixelPosition * PixelPositionToFullResPixel + FullResPixelOffset;
+
+	// TODO: split screen
+	BufferUV = FullResPixelPosition * View.BufferSizeAndInvSize.zw;
+    ScreenPos = ViewportUVToScreenPos(FullResPixelPosition * View.ViewSizeAndInvSize.zw);
+}
+
+float3 ComputeTranslatedWorldPositions(float2 ScreenPos, float SceneDepth)
+{
+	return mul(float4(GetScreenPositionForProjectionType(ScreenPos, SceneDepth), SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+}
+
+uint2 ComputePixelPosition(float3 TranslatedWorldPosition)
+{
+	float4 ClipPosition = mul(float4(TranslatedWorldPosition, 1), View.TranslatedWorldToClip);
+	float2 ScreenPos = ClipPosition.xy * rcp(ClipPosition.w);
+	float2 ViewportUV = ScreenPosToViewportUV(ScreenPos);
+	return uint2(ViewportUV * View.ViewSizeAndInvSize.xy);
+}
+
+float ComputeSceneDepth(float3 TranslatedWorldPosition)
+{
+	// TODO: do everything in view space instead of world space?
+	return mul(float4(TranslatedWorldPosition, 1.0), View.TranslatedWorldToView).z;
+}
+
+uint2 ComputeRandomSeed(uint2 PixelPosition)
+{
+	return Rand3DPCG16(int3(PixelPosition, View.StateFrameIndexMod8)).xy;
+}
+
+float3 ComputeL(float3 N, float2 E)
+{
+	float3x3 TangentBasis = GetTangentBasis(N);
+#if 1	
+	float3 TangentL = CosineSampleHemisphereConcentric(E).xyz;
+#else
+	float3 TangentL = CosineSampleHemisphere(E).xyz;
+#endif
+	return mul(TangentL, TangentBasis);
+}
+
+
+//------------------------------------------------------- ENTRY POINT
+
+// ===========================================================================
+// SHADERSHIFT -- SSGI Modes
+// ===========================================================================
+//
+// SSILVB indirect diffuse -- Screen Space Indirect Lighting with Visibility
+// Bitmask (Therrien, Levesque, Gilet 2023; arXiv:2301.11376, Algorithm 1).
+// Rewritten from scratch against the paper + the authors' reference code
+// (cdrinmatane.github.io/posts/ssaovb-code).  NOTE: the widely-circulated
+// cybereality GLSL port weights GI by (1 - newCoverage); the paper weights it
+// by newCoverage (countbits(b_j & ~b_i)/Nb).  We follow the paper.
+//
+// Lane -> slice mapping.  The engine dispatch gives each pixel CONFIG_RAY_COUNT
+// lanes (the z dimension of the threadgroup).  Where the stock shader casts
+// one Hammersley ray per lane, we instead trace ONE full SSILVB hemisphere
+// slice per lane.  The end-of-MainCS reduction already sums the per-lane
+// results and divides by CONFIG_RAY_COUNT -- which is exactly Algorithm 1's
+// "AO/Nd, GI/Nd" average over slice directions.  A slice is a *line* through
+// the pixel (both sides of the view vector V) sharing ONE 32-bit occlusion
+// bitmask, so CONFIG_RAY_COUNT lines spread over [0,PI) cover the hemisphere.
+//
+// CRITICAL: no lane may early-out of MainCS -- every lane must reach the LDS
+// write + GroupMemoryBarrierWithGroupSync() below, or the barrier deadlocks.
+// SSILVB_TraceSlice() therefore only ever "continue"s individual taps and
+// always returns; the dispatch writes CompressedColor and falls through.
+//
+// Per-tap math is done in translated-WORLD space.  Because View<->World is a
+// pure rotation, every dot/cross (and thus every horizon angle and the
+// projected-normal angle N) is numerically identical to the reference's
+// view-space formulation, but we sidestep all view-space Z-sign ambiguity and
+// avoid transforming each sample normal.  Screen-space stepping flips Y (UE UV
+// is Y-down while view/world up is +); the slice frame uses the un-flipped
+// view-space azimuth lifted to world via View.ViewToTranslatedWorld.
+//
+// Sample bindings match the stock shader:
+//   - SceneDepthTexture            -> reconstruct each tap's world position
+//   - Substrate.TopLayerTexture / GBuffer -> per-tap world normal (emitter cull)
+//   - ColorTexture (reduced prev-frame scene colour) + ColorBufferScaleBias
+//                                  -> per-tap incoming radiance
+//
+// Per slice: for each of 2 sides, march SSILVB_NUM_STEPS taps near->far:
+//   1. reconstruct tap world position from its depth sample
+//   2. front horizon = angle(tap dir, V); back horizon uses tap - V*thickness
+//   3. map both into the slice's [0,1] sector domain about the projected normal
+//   4. b_j = sectors this tap covers;  newBits = b_j & ~occludedMask
+//   5. if newBits: GI += (countbits(newBits)/Nb)*radiance*(n.l)*(n_tap.-l)
+//   6. occludedMask |= b_j
+//   end: occludedFraction = countbits(occludedMask)/Nb   (-> AO = 1 - mean)
+//
+#if CUSTOM_SSGI_MODE != 0
+
+// Stable per-pixel random seed for Stable SSGI mode.  Mirrors the engine's
+// ComputeRandomSeed(...) form (Rand3DPCG16 then .xy) but replaces
+// View.StateFrameIndexMod8 with a constant so the seed is frame-stable.
+//
+// CRITICAL: must use Rand3DPCG16 (16-bit output), NOT a 32-bit hash.
+// The engine's Hammersley16 does `Random.y * (1.0 / 65536.0)` and expects
+// Random.y to fit in 16 bits.  Passing a 32-bit seed makes the resulting
+// E2 >> 1.0, and CosineSampleHemisphereConcentric then returns degenerate
+// directions that all miss every surface in screen space (the symptom is
+// a completely dark indirect output and a fully-occluded AO buffer).
+// ===========================================================================
+// SHADERSHIFT Candidate A (option 2): hash-based Owen scrambling for jitter.
+// ===========================================================================
+//
+// Burley 2020, "Practical Hash-based Owen Scrambling", JCGT 9(4).
+// https://www.jcgt.org/published/0009/04/01/
+//
+// The Laine-Karras permutation is the inner step of hash-based Owen
+// scrambling.  Used here as a high-quality per-pixel hash for SSGI jitter,
+// replacing the previous Rand3DPCG16 calls.  Pure HLSL, no UB binding, no
+// texture taps -- so no risk of the SSGI render pass missing a required
+// resource (the trap that killed our STBN attempt).
+//
+// Why it's better than Rand3DPCG16 for our use case:
+//   - The xor-multiply chain passes more PractRand statistical tests than
+//     UE5's PCG16 mix (Rand3DPCG16's six chained multiply-adds give 16-bit
+//     output with measurable bias).
+//   - Better avalanche: a one-bit input change flips ~50%% of output bits,
+//     which means adjacent pixels see truly decorrelated values (no
+//     residual low-frequency structure that the bilateral struggles with).
+//   - When extended to multi-sample (multi-bounce SSGI / future K-loop),
+//     using this as the inner step of a proper Owen-scrambled Sobol gives
+//     stratified samples per pixel with strong low-discrepancy properties.
+//     We don't take advantage of that today (single-sample per pixel) but
+//     the helper is structured to support it.
+//
+// Magic constants are from Burley's paper (Table 2).
+uint ShaderShift_SSGI_LaineKarras(uint x, uint seed)
+{
+	x += seed;
+	x ^= x * 0x6c50b47cu;
+	x ^= x * 0xb82f1e52u;
+	x ^= x * 0xc7afe638u;
+	x ^= x * 0x8d22f6e6u;
+	return x;
+}
+
+// Two-component pseudo-random in [0, 1) per pixel.  Mixes pixel coords via
+// the golden-ratio constant 0x9e3779b9 for inter-axis decorrelation, then
+// draws two LK-permuted streams from the mixed seed.  Frame-stable.
+float2 ShaderShift_SSGI_OwenJitter2(uint2 PixelPos)
+{
+	uint Mixed = ShaderShift_SSGI_LaineKarras(
+		PixelPos.x ^ (PixelPos.y * 0x9e3779b9u),
+		0xa5a5a5a5u);
+	uint X = ShaderShift_SSGI_LaineKarras(Mixed, 0x68bc21ebu);
+	uint Y = ShaderShift_SSGI_LaineKarras(Mixed, 0x12345678u);
+	return float2(X, Y) * (1.0f / 4294967296.0f);
+}
+
+// Temporal variant: folds a frame index into the seed so the jitter pair is
+// freshly decorrelated EVERY FRAME.  This is the paper's sampling model --
+// "All benchmarks use one hemisphere slice per pixel jittered over multiple
+// frames" (arXiv:2301.11376, 4.1) -- and it is what the engine pipeline
+// expects: SSGI output runs through DenoiseScreenSpaceDiffuseIndirect
+// (ScreenSpaceDenoise.cpp), which does an 8-tap spatial reconstruction PLUS
+// temporal accumulation (r.GlobalIllumination.Denoiser.TemporalAccumulation,
+// default on).  A frame-stable pattern starves that accumulator: the same
+// CONFIG_RAY_COUNT slice azimuths are retraced forever, the temporal pass
+// integrates no new directions, and the result stays patchy/dim where those
+// particular slices found no light.  Per-frame jitter converges toward the
+// full hemisphere integral over the accumulation window instead.
+// STRATIFIED temporal sequence, not a per-frame re-hash: the spatial part is
+// the frame-independent Owen hash (per-pixel decorrelation), and the frame
+// advances it along the R2 low-discrepancy additive recurrence (Roberts 2018).
+// Re-hashing per frame gives white noise in time -- consecutive frames can
+// land on nearly the same azimuth and leave hemisphere gaps for many frames,
+// which the temporal accumulator turns into visible churn.  The R2 increment
+// guarantees near-uniform coverage of (azimuth, radial-offset) space over any
+// window of frames, so the accumulated estimate converges with far less
+// residual noise for the same sample count.  256-frame cycle keeps the
+// float math exact; plenty longer than any denoiser history.
+float2 ShaderShift_SSGI_TemporalJitter2(uint2 PixelPos, uint FrameIndex)
+{
+	float2 Spatial = ShaderShift_SSGI_OwenJitter2(PixelPos);
+	const float2 R2 = float2(0.7548776662f, 0.5698402909f);
+	return frac(Spatial + R2 * float(FrameIndex & 255u));
+}
+
+// Scalar version for callers that only need a single value (StepOffset etc.).
+float ShaderShift_SSGI_OwenJitter1(uint2 PixelPos)
+{
+	uint Mixed = ShaderShift_SSGI_LaineKarras(
+		PixelPos.x ^ (PixelPos.y * 0x9e3779b9u),
+		0xa5a5a5a5u);
+	return float(ShaderShift_SSGI_LaineKarras(Mixed, 0x68bc21ebu)) * (1.0f / 4294967296.0f);
+}
+
+uint2 ShaderShift_SSGI_StableSeed(uint2 PixelPosition)
+{
+	// Hammersley16 expects a uint2 seed; Owen-LK gives float2 in [0,1).
+	// Map to 16-bit range via * 65535 so it slots into Hammersley's seed
+	// position cleanly.  Better-distributed than Rand3DPCG16 (avalanche)
+	// and frame-stable (no temporal variation).
+	return uint2(ShaderShift_SSGI_OwenJitter2(PixelPosition) * 65535.0f);
+}
+
+// Frame-stable per-pixel jitter (kept for the Stable SSGI mode-3 path).
+// Uses hash-based Owen scrambling (Burley 2020, Laine-Karras helper above)
+// for higher-quality avalanche than Rand3DPCG16 -- adjacent pixels see
+// truly decorrelated values with no residual low-frequency structure for
+// the bilateral denoiser to chase.  Pure HLSL; no UB binding required.
+// NOTE: SSILVB (mode 1) uses ShaderShift_SSGI_TemporalJitter2 instead --
+// per-frame slice rotation feeding the engine's temporal accumulator.
+//
+// Returns .x for the slice azimuth, .y for the radial step.  The two
+// components come from independently-seeded LK permutations of the same
+// mixed pixel coordinate -- statistically independent.
+float2 ShaderShift_SSGI_StableJitter(float2 PixelPos)
+{
+	return ShaderShift_SSGI_OwenJitter2(uint2(PixelPos));
+}
+
+// Legacy IGN kept for any callers outside SSILVB; the SSILVB path now uses
+// the StableJitter hash above for visually-clean output.
+float ShaderShift_SSGI_IGN(float2 PixelPos, uint FrameMod)
+{
+	float3 m = float3(0.06711056f, 0.00583715f, 52.9829189f);
+	return frac(m.z * frac(dot(PixelPos + float2(5.588238f, 5.588238f) * float(FrameMod), m.xy)));
+}
+
+// Fast acos (max abs err ~6.8e-5).  Same constants as GTAO.
+float ShaderShift_SSGI_FastAcos(float x)
+{
+	float ax = abs(x);
+	float res = (-0.156583f * ax + (3.14159265f * 0.5f)) * sqrt(saturate(1.0f - ax));
+	return (x >= 0.0f) ? res : (3.14159265f - res);
+}
+
+// 32 visibility sectors pack into a single uint -- the paper's quality/perf
+// sweet spot (arXiv:2301.11376, 4.1).  A wider field needs a wider type.
+#define SSILVB_SECTOR_COUNT 32u
+
+// Steps taken per slice *side*.  A slice samples both sides of V, so taps per
+// slice = 2 * SSILVB_NUM_STEPS and taps per pixel = CONFIG_RAY_COUNT *
+// 2 * SSILVB_NUM_STEPS.  Scaled by engine QUALITY so r.SSGI.Quality drives cost.
+// Paper recommends 4-8 steps per side (arXiv:2301.11376, 4.1); we sit within
+// that range.  Per-lane variance beyond this is handled by the engine's SSGI
+// denoiser (8-tap spatial reconstruction + temporal accumulation over the
+// per-frame slice jitter), which is cheaper than more steps here.  The steps
+// are distributed exponentially (T^2) so the low counts still capture
+// near-field contact detail.
+#if QUALITY == 1
+	#define SSILVB_NUM_STEPS 4
+#elif QUALITY == 2
+	#define SSILVB_NUM_STEPS 5
+#elif QUALITY == 3
+	#define SSILVB_NUM_STEPS 6
+#else // QUALITY == 4
+	#define SSILVB_NUM_STEPS 8
+#endif
+
+// Build the bitmask of the sectors spanned by [MinH01, MaxH01] (both already
+// mapped to [0,1] across the slice's hemisphere) using the paper's ceil hit
+// criterion (Algorithm 1 lines 18-19; cdrinmatane UpdateSectors).  Returns this
+// tap's mask alone (b_j); the caller ORs it into the running occlusion mask.
+// Written to avoid the HLSL UB of shifting a 32-bit value by >= 32.
+uint SSILVB_UpdateSectorMask(float MinH01, float MaxH01)
+{
+	MinH01 = saturate(MinH01);
+	MaxH01 = saturate(MaxH01);
+	uint StartBit = min((uint)(MinH01 * float(SSILVB_SECTOR_COUNT)), SSILVB_SECTOR_COUNT - 1u);
+	uint NumBits  = min((uint)ceil(saturate(MaxH01 - MinH01) * float(SSILVB_SECTOR_COUNT)), SSILVB_SECTOR_COUNT);
+	if (NumBits == 0u)
+	{
+		return 0u;
+	}
+	// NumBits low bits set (all-ones when NumBits == 32, since then the shift is 0).
+	uint Mask = 0xFFFFFFFFu >> (SSILVB_SECTOR_COUNT - NumBits);
+	return Mask << StartBit;
+}
+
+// Read world-space normal at SampleBufferUV.  Mirrors the receiver-side
+// branch the engine uses earlier in MainCS.
+float3 ShaderShift_SSGI_LoadSampleWorldNormal(float2 SampleBufferUV)
+{
+#if SUBSTRATE_GBUFFER_FORMAT==1
+	uint2 SamplePixel = uint2(clamp(SampleBufferUV * View.BufferSizeAndInvSize.xy, 0.0f, View.BufferSizeAndInvSize.xy - 1.0f));
+	const FSubstrateTopLayerData TopLayer = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(SamplePixel, 0)));
+	return TopLayer.WorldNormal;
+#else
+	FGBufferData SampleGB = GetGBufferDataFromSceneTextures(SampleBufferUV);
+	return SampleGB.WorldNormal;
+#endif
+}
+
+// Read previous-frame scene color at SampleBufferUV via the reduced color
+// buffer used by the rest of this shader for hit sampling.
+//
+// MipLevel is the anti-boil lever: a tap stands in for the whole patch of
+// emitter surface between it and its radial neighbours, so it must return
+// the AREA-AVERAGED radiance of that patch, not a single mip-0 texel.
+// Point-sampling made each tap a per-frame lottery (bright texel vs dark
+// texel), and since the buffer also contains LAST frame's SSGI, the lottery
+// fed back on itself -- the persistent boiling.  The engine's stock path
+// does the same prefilter (its cone-based `Level`), as does the authors'
+// SSRT3 reference (distance-based light-buffer LOD).
+float3 ShaderShift_SSGI_LoadSampleColor(float2 SampleBufferUV, float MipLevel)
+{
+	float2 ReducedColorUV = SampleBufferUV * ColorBufferScaleBias.xy + ColorBufferScaleBias.zw;
+	ReducedColorUV = min(ReducedColorUV, ReducedColorUVMax);
+	float3 Color = ColorTexture.SampleLevel(ColorTextureSampler, ReducedColorUV, MipLevel).rgb;
+
+	// Soft firefly clamp.  The buffer is pre-exposed, so 8.0 is ~3 stops
+	// above middle grey: legitimate bounce light passes untouched, while a
+	// rare ultra-bright texel (specular hotspot, emissive spark, or last
+	// frame's own GI noise) can no longer inject an impulse the temporal
+	// accumulator visibly "discovers" and "loses" frame to frame.  This is
+	// mode 1's replacement for the engine's Karis fold (which is disabled
+	// for SSILVB because folding a many-sample slice SUM distorts it).
+	float Luma = dot(Color, float3(0.2126f, 0.7152f, 0.0722f));
+	Color *= min(1.0f, 8.0f / max(Luma, 1e-4f));
+	return Color;
+}
+
+// Helper to reliably transform full-resolution buffer pixel position to active viewport UV coords.
+float2 ShaderShift_SSGI_GetViewportUV(float2 FullResPixel)
+{
+	return (FullResPixel - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw;
+}
+
+// One SSILVB hemisphere slice, evaluated in translated-WORLD space.  A slice
+// is a line through the pixel (both sides of V) sharing ONE occlusion bitmask,
+// exactly as in Algorithm 1.  Returns (indirect diffuse RGB, occluded fraction
+// in [0,1]).  Never early-outs the whole group -- individual taps only "continue".
+//
+// World space is provably rotation-equivalent to the reference's view-space
+// math (View<->World is orthonormal, det +1, so every dot/cross and thus every
+// angle is identical) but sidesteps view-space Z-sign ambiguity and avoids
+// transforming each tap normal.
+float4 SSILVB_TraceSlice(
+	float3 ReceiverTWPos,      // receiver translated-world position
+	float3 ReceiverWorldN,     // receiver world-space normal (unit)
+	float3 V,                  // receiver -> camera, world space (unit)
+	float2 ReceiverFullResPixel,
+	float  ReceiverSceneDepth, // linear view-space depth (cm), > 0
+	uint   SliceIndex,
+	uint   NumSlices,
+	uint   FrameMod)
+{
+	float NLenSq = dot(ReceiverWorldN, ReceiverWorldN);
+	if (NLenSq < 1e-8f) { return float4(0.0f, 0.0f, 0.0f, 0.0f); }
+	ReceiverWorldN *= rsqrt(NLenSq);
+
+	// Per-pixel + PER-FRAME rotation and step jitter.  Two independent
+	// values: J.x rotates the slice fan, J.y offsets the radial steps.
+	// The frame index folds into the hash so every frame traces a fresh set
+	// of slice azimuths -- the paper's "one slice jittered over multiple
+	// frames" model.  The engine's SSGI denoiser (spatial reconstruction +
+	// temporal accumulation) then integrates the rotating pattern toward
+	// the full hemisphere.  (A previous revision used a frame-STABLE hash
+	// here to avoid shimmer; that starved the temporal accumulator and was
+	// a major cause of the patchy, dim, over-blurred result.)
+	float2 J = ShaderShift_SSGI_TemporalJitter2(uint2(ReceiverFullResPixel + 0.5f), FrameMod);
+	float Jitter = J.x;          // slice azimuth offset
+	// Radial step offset, decorrelated PER SLICE by a golden-ratio stride.
+	// With a single shared J.y, every slice of the pixel marched on the same
+	// radial phase, so the whole per-frame estimate swung together when the
+	// phase changed -- a large correlated term in the frame-to-frame variance
+	// (visible as boiling).  Giving each slice its own phase converts that
+	// into intra-frame variance that the lane average cancels immediately.
+	float RadialJitter = frac(J.y + float(SliceIndex) * 0.6180339887f);
+
+	// Slice azimuth.  Two-sided sampling means one line spans a diameter, so
+	// NumSlices lines spread over [0, PI) cover the full hemisphere.
+	float Phi = (float(SliceIndex) + Jitter) * (3.14159265f / float(NumSlices));
+	float2 Omega = float2(cos(Phi), sin(Phi));
+
+	// View-space slice direction (screen X/Y ~= view X/Y) lifted to world for
+	// the slice frame; screen/pixel stepping flips Y (UE UV is Y-down, up is +).
+	float3 WorldSliceDir = mul(float4(Omega.x, Omega.y, 0.0f, 0.0f), View.ViewToTranslatedWorld).xyz;
+	float2 PixelStepDir  = float2(Omega.x, -Omega.y);
+
+	// Slice frame (cdrinmatane / GTAO): project the receiver normal into the
+	// slice plane and take its signed angle from V.
+	float3 SliceN = cross(WorldSliceDir, V);
+	float SliceNLenSq = dot(SliceN, SliceN);
+	if (SliceNLenSq < 1e-8f) { return float4(0.0f, 0.0f, 0.0f, 0.0f); }
+	SliceN *= rsqrt(SliceNLenSq);
+
+	float3 ProjN = ReceiverWorldN - SliceN * dot(ReceiverWorldN, SliceN);
+	float ProjNLenSq = dot(ProjN, ProjN);
+	if (ProjNLenSq < 1e-8f) { return float4(0.0f, 0.0f, 0.0f, 0.0f); }
+	float InvProjNLen = rsqrt(ProjNLenSq);
+	float CosN = clamp(dot(ProjN, V) * InvProjNLen, -1.0f, 1.0f);
+	float3 T = cross(V, SliceN);
+	float NAngle = -sign(dot(ProjN, T)) * ShaderShift_SSGI_FastAcos(CosN);
+
+	// World radius -> on-screen footprint (px).  ViewToClip[1][1] is the
+	// vertical NDC focal length; * viewHeight/2 -> pixels; / depth -> projected
+	// size of CUSTOM_SSGI_RADIUS at this pixel.  Lower clamp keeps StepPx >= 1px;
+	// upper clamp bounds bandwidth when the radius projects huge up close.
+	float PixelRadius = CUSTOM_SSGI_RADIUS * View.ViewToClip[1][1] * View.ViewSizeAndInvSize.y * 0.5f
+	                  / max(ReceiverSceneDepth, 1.0f);
+	PixelRadius = clamp(PixelRadius, float(SSILVB_NUM_STEPS), CUSTOM_SSGI_MAX_SCREEN_FRACTION * View.ViewSizeAndInvSize.y);
+	float StepPx = PixelRadius / float(SSILVB_NUM_STEPS);
+
+	// Constant world-space thickness, optionally growing with depth (paper 3.1).
+	float Thickness = CUSTOM_SSGI_THICKNESS
+	                * (1.0f + (ReceiverSceneDepth * 0.01f) * CUSTOM_SSGI_THICKNESS_DISTANCE);
+
+	const float HalfPI = 3.14159265f * 0.5f;
+	const float InvPI  = 1.0f / 3.14159265f;
+
+	uint   OccludedMask = 0u;             // shared across BOTH sides of the slice (b_i)
+	float3 GI = float3(0.0f, 0.0f, 0.0f);
+
+	UNROLL for (int Side = 0; Side < 2; ++Side)
+	{
+		float SignDir = (Side == 0) ? 1.0f : -1.0f;
+
+		UNROLL for (uint s = 1u; s <= (uint)SSILVB_NUM_STEPS; ++s)
+		{
+			// PERF: once every sector this side could touch is already occluded by
+			// closer taps, future taps cannot add new visibility.  Skip the depth
+			// read + math + (possible) normal/colour reads -- pure win for cluttered
+			// scenes where the first 1-2 taps already saturate the bitmask.
+			if (OccludedMask == 0xFFFFFFFFu) { break; }
+
+			// Exponential step distribution (paper 4.3: "we distribute the
+			// samples exponentially around the shaded pixel, as nearby
+			// surfaces usually have more influence on the result than
+			// farther ones").  T in (0,1] is squared so early taps cluster
+			// near the receiver -- this is where contact bounce/occlusion
+			// detail lives; the previous LINEAR spacing under-sampled it and
+			// washed out fine detail.  The max() keeps taps at least ~1px
+			// apart at the near end so consecutive taps don't re-read the
+			// same texel.
+			float T = (float(s) - RadialJitter) / float(SSILVB_NUM_STEPS);   // (0,1]
+			float StepDist = max(T * T * PixelRadius, float(s) - RadialJitter);
+			float2 SamplePixel = ReceiverFullResPixel + SignDir * PixelStepDir * StepDist;
+
+			// Reject taps outside the active viewport (avoid wrapped/garbage reads).
+			if (any(SamplePixel < View.ViewRectMin.xy) ||
+			    any(SamplePixel >= View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy))
+			{
+				continue;
+			}
+
+			float2 SampleBufferUV = SamplePixel * View.BufferSizeAndInvSize.zw;
+			float SampleDeviceZ = SceneDepthTexture.SampleLevel(SceneDepthTextureSampler, SampleBufferUV, 0).r;
+			if (SampleDeviceZ <= 0.0f) { continue; }   // reversed-Z: 0 == sky / far plane
+
+			// Reconstruct the tap's translated-world position from its depth.
+			float SampleSceneDepth = ConvertFromDeviceZ(SampleDeviceZ);
+			float2 SampleScreenPos = ViewportUVToScreenPos(SamplePixel * View.ViewSizeAndInvSize.zw);
+			float3 SampleTWPos = mul(
+				float4(GetScreenPositionForProjectionType(SampleScreenPos, SampleSceneDepth), SampleSceneDepth, 1.0f),
+				View.ScreenToTranslatedWorld).xyz;
+
+			float3 DeltaPos = SampleTWPos - ReceiverTWPos;
+			float DeltaLenSq = dot(DeltaPos, DeltaPos);
+			if (DeltaLenSq < 1e-4f) { continue; }   // coincident tap -> avoid rsqrt(0)
+			// NO hard world-distance cull: the paper attenuates with the constant
+			// thickness model, not a falloff/radius cutoff.  A cull here rejects the
+			// very surfaces that light the pixel (it was crushing coverage to ~5%).
+			// The on-screen march (PixelRadius) is the only bound; far emitters
+			// self-attenuate through shrinking sector coverage and the cosE term.
+
+			float InvLen = rsqrt(DeltaLenSq);
+			float3 SampleDir = DeltaPos * InvLen;       // l_j (receiver -> sample, world)
+
+			// Front horizon at the tap; back horizon at the tap pushed by the
+			// constant thickness along -V.  Both expressed as cos(angle) with V.
+			float3 DeltaBack = DeltaPos - V * Thickness;
+			float CosFront = clamp(dot(SampleDir, V), -1.0f, 1.0f);
+			// Guard the back-horizon normalize: a tap ~thickness in front along V
+			// makes DeltaBack ~ 0, and normalize(0) would inject a NaN.
+			float CosBack  = clamp(dot(DeltaBack * rsqrt(max(dot(DeltaBack, DeltaBack), 1e-8f)), V), -1.0f, 1.0f);
+			float FrontAngle = ShaderShift_SSGI_FastAcos(CosFront);
+			float BackAngle  = ShaderShift_SSGI_FastAcos(CosBack);
+
+			// Shift from V to the projected normal and clamp into the slice's
+			// [0,1] hemisphere domain.  The per-side .yx/.xy swap (reference)
+			// keeps min <= max for UpdateSectorMask.
+			float MappedFront = saturate((SignDir * -FrontAngle - NAngle + HalfPI) * InvPI);
+			float MappedBack  = saturate((SignDir * -BackAngle  - NAngle + HalfPI) * InvPI);
+			float MinH = (SignDir >= 0.0f) ? MappedBack : MappedFront;
+			float MaxH = (SignDir >= 0.0f) ? MappedFront : MappedBack;
+
+			uint SampleMask = SSILVB_UpdateSectorMask(MinH, MaxH);   // b_j
+			uint NewBits = SampleMask & ~OccludedMask;               // b_j & ~b_i
+
+			if (NewBits != 0u)
+			{
+				// PERF: CosReceiver only needs the receiver normal + SampleDir, both
+				// already in registers.  Cull tangent-plane and below-tangent samples
+				// HERE so we never pay for the sample-normal + scene-colour texture
+				// reads on contributions that would multiply to zero anyway.
+				float CosReceiver = saturate(dot(ReceiverWorldN, SampleDir));   // n_p . l_j
+				if (CosReceiver > 0.0f)
+				{
+					float3 SampleWorldN = ShaderShift_SSGI_LoadSampleWorldNormal(SampleBufferUV);
+					float SampleNLenSq = dot(SampleWorldN, SampleWorldN);
+					if (SampleNLenSq > 1e-6f)
+					{
+						SampleWorldN *= rsqrt(SampleNLenSq);
+						// TWO-SIDED EMITTER: abs() instead of saturate() on the emitter
+						// cosine.  Strict back-face cull (saturate(dot(n_j, -l_j)))
+						// produces a 'halo of no radiosity in the shape of the object'
+						// around every foreground occluder: SSGI only sees the camera-
+						// facing surface, but receivers BEHIND that surface in world
+						// space have -SampleDir pointing INTO the surface, so cos(n_j,-l_j)
+						// is negative and the contribution is zero.  Treating each visible
+						// surface as a two-sided emitter (abs of the dot) approximates the
+						// missing back-face contribution as 'same colour as the visible
+						// front' -- exact for solid colour objects, a good approximation
+						// for most opaque materials under single-bounce SSGI.
+						float CosEmitter = abs(dot(SampleWorldN, -SampleDir));    // n_j . -l_j, two-sided
+						if (CosEmitter > 0.0f)
+						{
+							// Distance-based colour mip: this tap represents the
+							// emitter patch out to its radial neighbours, whose
+							// on-screen footprint grows with StepDist (exponential
+							// stepping).  log2(StepDist)-2 -> taps within ~4px read
+							// mip 0, ~32px read mip 3, capped at 5.  (The reduced
+							// colour buffer ships a full mip chain -- the stock ray
+							// path already samples it at its cone 'Level'.)
+							float ColorMip = clamp(log2(max(StepDist, 1.0f)) - 2.0f, 0.0f, 5.0f);
+							float3 SampleColor = ShaderShift_SSGI_LoadSampleColor(SampleBufferUV, ColorMip); // c_j
+							float Coverage = float(countbits(NewBits)) / float(SSILVB_SECTOR_COUNT);
+							// Paper Algorithm 1, line 23.  No distance falloff: the
+							// constant-thickness bitmask reproduces attenuation.
+							GI += SampleColor * (Coverage * CosReceiver * CosEmitter);
+						}
+					}
+				}
+			}
+
+			OccludedMask |= SampleMask;   // b_i |= b_j
+		}
+	}
+
+	float OccludedFraction = float(countbits(OccludedMask)) / float(SSILVB_SECTOR_COUNT);
+
+	// Engine-parity normalisation.  The engine's stock SSGI estimator is the
+	// plain mean of cosine-importance-sampled hit radiance, so for a uniform
+	// surround of radiance L it reports exactly L.  The SSILVB slice sum
+	// Sum(coverage * cosR) integrates to Int_{-pi/2}^{pi/2} cos(t) dt/pi
+	// = 2/pi ~= 0.64 for the same surround -- i.e. the paper estimator runs
+	// ~1.6x darker than what UE's diffuse-indirect composite expects.  The
+	// pi/2 factor restores parity so CUSTOM_SSGI_INTENSITY == 1.0 means
+	// "engine-equivalent brightness" instead of an opaque fudge.
+	return float4(GI * 1.5707963f, OccludedFraction);
+}
+
+#endif // CUSTOM_SSGI_MODE != 0
+
+[numthreads(TILE_PIXEL_SIZE_X, TILE_PIXEL_SIZE_Y, CONFIG_RAY_COUNT)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	// Id of the wave in the group.
+	uint GroupWaveIndex = GroupThreadIndex / 64;
+	
+	FSSRTTileInfos TileInfos;
+	{
+		const uint BinsAddress = TILE_PIXEL_COUNT * 2;
+
+		uint GroupPixelId = GroupThreadIndex % TILE_PIXEL_COUNT;
+		uint RaySequenceId = GroupThreadIndex / TILE_PIXEL_COUNT;
+
+		// Compute TileCoord from GroupId to ensure the compiler understand it is group invariant to use scalar load.
+		uint2 TileCoord = GroupId / uint2(SSRT_TILE_RES_DIVISOR / TILE_PIXEL_SIZE_X, SSRT_TILE_RES_DIVISOR / TILE_PIXEL_SIZE_Y);
+		TileInfos = LoadTileInfos(TileCoord);
+
+		// Store GBuffer into LDS
+		BRANCH
+		if (RaySequenceId == 0)
+		{
+			uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+            uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+				
+			float2 BufferUV = 0;
+			float2 ScreenPos = 0;
+			float2 FullResPixelPosition = 0;
+			UpdateLane2DCoordinateInformations(PixelPosition, /* out */ BufferUV, /* out */ ScreenPos, /* out */ FullResPixelPosition);
+	
+		#if SUBSTRATE_GBUFFER_FORMAT==1
+			const FSubstrateTopLayerData TopLayerData = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(FullResPixelPosition, 0)));
+			const float Roughness = TopLayerData.Roughness;
+			const float3 WorldNormal = TopLayerData.WorldNormal;
+			const bool bIsValid = IsSubstrateMaterial(TopLayerData);
+		#else // SUBSTRATE_GBUFFER_FORMAT==1
+			FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+			const float Roughness = GBuffer.Roughness;
+			const float3 WorldNormal = GBuffer.WorldNormal;
+			const bool bIsValid = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT;
+		#endif // SUBSTRATE_GBUFFER_FORMAT==1
+
+			float DeviceZ = SceneDepthTexture.SampleLevel(SceneDepthTextureSampler, BufferUV, 0).r;
+
+			float ProbeOcclusionDistance = ProbeOcclusionDistanceTexture.Load(int3(PixelPosition, 0)).x;
+
+			bool bTraceRay = bIsValid;
+				
+			#if CONFIG_LDS_STORE_VIEW_N
+				SharedMemory0[TILE_PIXEL_COUNT * 0 | GroupPixelId] = CompressN(mul(float4(WorldNormal, 0), View.TranslatedWorldToView).xyz);
+			#else
+				SharedMemory0[TILE_PIXEL_COUNT * 0 | GroupPixelId] = CompressN(WorldNormal);
+			#endif
+			SharedMemory0[TILE_PIXEL_COUNT * 1 | GroupPixelId] = asuint(bTraceRay ? DeviceZ : -1.0);
+
+			#if DIM_LIGHTING_TERM == DIFFUSE_TERM
+			{
+			#if CUSTOM_SSGI_MODE == 1 || CUSTOM_SSGI_MODE == 3
+				// SHADERSHIFT: stash receiver data in SharedMemory1 for the tile-local
+				// bilateral denoiser in the reduction phase.  SharedMemory0's copies
+				// get overwritten by the per-ray colour writes (DestPos overlap).
+				//
+				// Layout:
+				//   [0                  .. TILE_PIXEL_COUNT)   = DeviceZ
+				//   [TILE_PIXEL_COUNT   .. 2*TILE_PIXEL_COUNT) = CompressN (world normal)
+				//
+				// The bilateral uses BOTH for joint depth+normal edge stops so the
+				// depth tolerance can be loose (wide smoothing within continuous
+				// surfaces) without bleeding colour across surfaces of different
+				// orientation that happen to be at similar depth (corner cases like
+				// wall-meets-floor).  TILE_PIXEL_COUNT is at most 64 for QUALITY 1,
+				// SharedMemory1 has LANE_PER_GROUPS = 256 slots, plenty of room.
+				SharedMemory1[GroupPixelId] = asuint(bTraceRay ? DeviceZ : -1.0f);
+				SharedMemory1[TILE_PIXEL_COUNT | GroupPixelId] = CompressN(WorldNormal);
+			#endif
+				// NOP
+			}
+			#elif DIM_LIGHTING_TERM == SPECULAR_TERM
+			{
+				SharedMemory1[GroupPixelId] = asuint(Roughness);
+			}
+			#else
+				#error Unnimplemented
+			#endif
+		}
+		else if (GroupWaveIndex == 1) // TODO.
+		{
+			// Clears the bins
+			SharedMemory0[BinsAddress | GroupPixelId] = 0;
+		}
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+	// Shoot ray
+	{
+		uint GroupPixelId;
+		uint RaySequenceId;
+		uint CompressedN;
+		float DeviceZ;
+		float Roughness;
+		float ProbeOcclusionDistance;
+		bool bTraceRay;
+		{
+			GroupPixelId = GroupThreadIndex % TILE_PIXEL_COUNT;
+			RaySequenceId = GroupThreadIndex / TILE_PIXEL_COUNT;
+
+			uint Raw0 = SharedMemory0[TILE_PIXEL_COUNT * 0 | GroupPixelId];
+			uint Raw1 = SharedMemory0[TILE_PIXEL_COUNT * 1 | GroupPixelId];
+			uint Raw2 = SharedMemory1[TILE_PIXEL_COUNT * 0 | GroupPixelId];
+
+			CompressedN = Raw0;
+			DeviceZ = asfloat(Raw1);
+			bTraceRay = asfloat(Raw1) > 0;
+
+			#if DIM_LIGHTING_TERM == DIFFUSE_TERM
+			{
+				Roughness = 0;
+				ProbeOcclusionDistance = 0;
+			}
+			#elif DIM_LIGHTING_TERM == SPECULAR_TERM
+			{
+				Roughness = asfloat(Raw2);
+				ProbeOcclusionDistance = 0;
+			}
+			#else
+				#error Unnimplemented
+			#endif
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		#if DEBUG_RAY_COUNT
+			float DebugRayCount = 0.0;
+		#endif
+		uint2 CompressedColor;
+
+		
+		if (RaySequenceId == 0 && 0)
+		{
+			uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+			uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+			//DebugOutput[PixelPosition] = float4(DeviceZ, bTraceRay ? 1 : 0, 0, 0);
+			//DebugOutput[PixelPosition] = float4(N * 0.5 + 0.5, 0);
+		}
+
+		BRANCH
+		if (bTraceRay)
+		{
+			float3 N;
+			float3 ViewN;
+			#if CONFIG_LDS_STORE_VIEW_N
+			{
+				ViewN = DecompressN(CompressedN);
+				N = mul(float4(ViewN, 0), View.ViewToTranslatedWorld).xyz;
+			}
+			#else
+			{
+				N = DecompressN(CompressedN);
+				ViewN = mul(float4(N, 0), View.TranslatedWorldToView).xyz;
+			}
+			#endif
+
+			float a = Roughness * Roughness;
+			float a2 = a * a;
+
+			float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+			uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+			uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+	
+			float2 BufferUV = 0;
+			float2 ScreenPos = 0;
+			float2 FullResPixelPosition = 0;
+			UpdateLane2DCoordinateInformations(PixelPosition, /* out */ BufferUV, /* out */ ScreenPos, /* out */ FullResPixelPosition); 
+	
+			float3 PositionTranslatedWorld = mul(float4(GetScreenPositionForProjectionType(ScreenPos, SceneDepth), SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+			float3 V = -GetCameraVectorFromTranslatedWorldPosition(PositionTranslatedWorld);
+
+			float StepOffset = InterleavedGradientNoise(PixelPosition + 0.5, View.StateFrameIndexMod8);
+	
+			#if !SSGI_TRACE_CONE
+				StepOffset -= 0.9;
+			#endif
+
+            bool bDebugPrint = all(PixelPosition == uint2(View.ViewSizeAndInvSize.xy) / 2);
+
+#if CUSTOM_SSGI_MODE == 3 && DIM_LIGHTING_TERM == DIFFUSE_TERM
+			{
+				// SHADERSHIFT Stable SSGI -- frame-stable seed + step offset,
+				// with K-ray supersampling per lane (K = CUSTOM_SSGI_RAY_MULTIPLIER).
+				//
+				// Each compute lane casts K rays drawn from a Hammersley sequence of
+				// length CONFIG_RAY_COUNT * K.  The K results are Karis-weighted,
+				// averaged, and encoded into CompressedColor.  Downstream LDS write
+				// + barrier + bilateral reduction is unchanged; the bilateral filter
+				// now averages K*N samples per pixel (N = CONFIG_RAY_COUNT) so the
+				// noise floor drops by sqrt(K).
+				uint2 StableRandomSeed = ShaderShift_SSGI_StableSeed(PixelPosition);
+				// Owen-LK hash for per-pixel step offset.  IGN at frame=0 has a
+				// visible diagonal-gradient spatial structure even when temporally
+				// stable; OwenJitter1 has no such structure (avalanche output).
+				float StableStepOffset = ShaderShift_SSGI_OwenJitter1(uint2(PixelPosition));
+				#if !SSGI_TRACE_CONE
+					StableStepOffset -= 0.9;
+				#endif
+
+				float3 SumDiffuse = float3(0.0f, 0.0f, 0.0f);
+				float  SumAO = 0.0f;
+
+				UNROLL for (uint Sub = 0u; Sub < (uint)CUSTOM_SSGI_RAY_MULTIPLIER; ++Sub)
+				{
+					uint EffectiveIdx   = RaySequenceId * (uint)CUSTOM_SSGI_RAY_MULTIPLIER + Sub;
+					uint EffectiveCount = (uint)CONFIG_RAY_COUNT * (uint)CUSTOM_SSGI_RAY_MULTIPLIER;
+					float2 E = Hammersley16(EffectiveIdx, EffectiveCount, StableRandomSeed);
+					float3 ViewL = ComputeL(ViewN, E);
+					FSSRTRay SubRay = InitScreenSpaceRay(ScreenPos, DeviceZ, ViewL);
+
+					float SubLevel;
+					float3 SubHitUVz;
+					bool   SubHit;
+					bool   SubUncertain;
+					{
+						float3 SubDebugOutput;
+						CastScreenSpaceRay(
+							FurthestHZBTexture, FurthestHZBTextureSampler,
+							1.0,
+							CreateDefaultCastSettings(),
+							SubRay, 1.0, CONFIG_RAY_STEPS, StableStepOffset,
+							HZBUvFactorAndInvFactor, false,
+							SubDebugOutput, SubHitUVz, SubLevel, SubHit, SubUncertain);
+					}
+
+					if (SubHit)
+					{
+						float2 SubReducedUV = SubHitUVz.xy * ColorBufferScaleBias.xy + ColorBufferScaleBias.zw;
+						SubReducedUV = min(SubReducedUV, ReducedColorUVMax);
+						float4 SubColor = ColorTexture.SampleLevel(ColorTextureSampler, SubReducedUV, SubLevel);
+						float SubWeight = 1.0f;
+						#if CONFIG_KARIS_WEIGHTING
+							SubWeight *= rcp(1.0f + Luminance(SubColor.rgb));
+						#endif
+						SumDiffuse += SubColor.rgb * SubWeight;
+						SumAO += 1.0f;
+					}
+				}
+
+				float InvK = rcp(float(CUSTOM_SSGI_RAY_MULTIPLIER));
+				SumDiffuse *= InvK;
+				SumAO     *= InvK;
+
+				CompressedColor.x = asuint(f32tof16(SumDiffuse.r) << 16 | f32tof16(SumDiffuse.g));
+				CompressedColor.y = asuint(f32tof16(SumDiffuse.b) << 16 | f32tof16(SumAO));
+			}
+#elif CUSTOM_SSGI_MODE == 2 && DIM_LIGHTING_TERM == DIFFUSE_TERM
+			{
+				// SHADERSHIFT SSILVB DIAGNOSTIC MODE -- writes bright magenta into
+				// IndirectDiffuseOutput so the user can verify the patch is executing.
+				// If you switch SSGI Method to Diagnostic and the scene goes magenta,
+				// the shader hook is applying and the substitution worked.  If the
+				// scene looks unchanged, the patch isn't reaching the GPU.
+				float3 Diag = float3(1.0f, 0.0f, 1.0f);  // pure magenta
+				#if CONFIG_KARIS_WEIGHTING
+					Diag *= rcp(1.0f + Luminance(Diag));
+				#endif
+				CompressedColor.x = asuint(f32tof16(Diag.r) << 16 | f32tof16(Diag.g));
+				CompressedColor.y = asuint(f32tof16(Diag.b) << 16 | f32tof16(0.0f));
+			}
+#elif CUSTOM_SSGI_MODE == 1 && DIM_LIGHTING_TERM == DIFFUSE_TERM
+			{
+				// SHADERSHIFT SSILVB indirect-diffuse dispatch.  Each lane traces
+				// ONE hemisphere slice for this pixel; the end-of-MainCS reduction
+				// already sums the per-slice (RGB, occluded) across all
+				// CONFIG_RAY_COUNT lanes and divides by the lane count -- exactly
+				// Algorithm 1's per-direction average.  No early return: every lane
+				// must reach the LDS write + barrier below or the group deadlocks.
+				//
+				// All inputs are receiver-space values the stock code already
+				// computed above: translated-world position, world normal, the
+				// world view vector V, the full-res pixel, and linear depth.
+				// The frame index goes in as the temporal seed: the slice fan
+				// advances along an R2 low-discrepancy sequence each frame, and
+				// the engine's SSGI denoiser (8-tap spatial reconstruction +
+				// temporal accumulation in DenoiseScreenSpaceDiffuseIndirect)
+				// integrates the rotating signal toward the full hemisphere --
+				// the paper's "one slice jittered over multiple frames" model.
+				//
+				// K-slice supersampling (same scheme as Stable SSGI): each lane
+				// traces K = CUSTOM_SSGI_RAY_MULTIPLIER slices drawn from a fan
+				// of CONFIG_RAY_COUNT * K azimuths, and writes their mean.  The
+				// per-pixel slice count scales by K, dropping the raw noise
+				// floor by sqrt(K) before any filtering.
+				float4 SliceResult = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+				UNROLL for (uint SS_Sub = 0u; SS_Sub < (uint)CUSTOM_SSGI_RAY_MULTIPLIER; ++SS_Sub)
+				{
+					uint SS_EffectiveIdx   = RaySequenceId * (uint)CUSTOM_SSGI_RAY_MULTIPLIER + SS_Sub;
+					uint SS_EffectiveCount = (uint)CONFIG_RAY_COUNT * (uint)CUSTOM_SSGI_RAY_MULTIPLIER;
+
+					SliceResult += SSILVB_TraceSlice(
+						PositionTranslatedWorld,
+						N,
+						normalize(V),
+						FullResPixelPosition,
+						SceneDepth,
+						SS_EffectiveIdx,
+						SS_EffectiveCount,
+						View.StateFrameIndex);
+				}
+				SliceResult *= rcp(float(CUSTOM_SSGI_RAY_MULTIPLIER));
+
+				float3 SliceDiffuse  = SliceResult.rgb * SSL_KNOB_30(CUSTOM_SSGI_INTENSITY);
+				// Scale the occlusion this pass contributes (see CUSTOM_SSGI_AO_STRENGTH).
+				// At 0 the slot is 0 -> the reduction's "1 - mean" yields AO = 1
+				// (neutral), so SSILVB occlusion no longer darkens skylight/ambient.
+				float  SliceOccluded = SliceResult.a * CUSTOM_SSGI_AO_STRENGTH;
+
+				// NO Karis firefly fold here.  That reciprocal-weight trick is for
+				// single ray-hit colours; an SSILVB slice already sums many samples,
+				// and folding the slice sum (then unfolding the mean downstream)
+				// compresses legitimate bright bounces and dims the result.  Mode 1
+				// uses a clean linear mean -- the reduction's unfold is gated off to
+				// match (see the CONFIG_KARIS_WEIGHTING block in the store phase).
+				CompressedColor.x = asuint(f32tof16(SliceDiffuse.r) << 16 | f32tof16(SliceDiffuse.g));
+				CompressedColor.y = asuint(f32tof16(SliceDiffuse.b) << 16 | f32tof16(SliceOccluded));
+			}
+#else
+			// Initialize the ray
+			FSSRTRay Ray;
+			float RayRoughness;
+			float3 L;
+			bool bRayWasClipped;
+
+			#if DIM_LIGHTING_TERM == DIFFUSE_TERM
+			{
+				uint2 RandomSeed = ComputeRandomSeed(PixelPosition);
+				float2 E = Hammersley16(RaySequenceId, CONFIG_RAY_COUNT, RandomSeed);		
+			
+				float3 ViewL = ComputeL(ViewN, E);
+				Ray = InitScreenSpaceRay(ScreenPos, DeviceZ, ViewL);
+				bRayWasClipped = true; // TODO(Guillaume)
+				RayRoughness = 1.0;
+				L = 0.0;
+			}
+			#elif DIM_LIGHTING_TERM == SPECULAR_TERM
+			{
+				uint2 RandomSeed = ComputeRandomSeed(PixelPosition);
+				float2 E = Hammersley16(RaySequenceId, CONFIG_RAY_COUNT, RandomSeed);		
+			
+				float3x3 TangentBasis = GetTangentBasis(N);
+				float3 TangentV = mul(TangentBasis, V);
+				
+				float3 H = mul(ImportanceSampleVisibleGGX(E, a, TangentV).xyz, TangentBasis);
+				L = 2 * dot( V, H ) * H - V;
+
+				Ray = InitScreenSpaceRayFromWorldSpace(
+					PositionTranslatedWorld, L,
+					/* WorldTMax = */ SceneDepth,
+					/* SceneDepth = */ SceneDepth,
+					/* SlopeCompareToleranceScale */ 2.0f,
+					/* bExtendRayToScreenBorder = */ true,
+					/* out */ bRayWasClipped);
+				
+				RayRoughness = Roughness * 0.25;
+			}
+			#else
+				#error Unnimplemented
+			#endif
+
+			// Cast the ray
+			float Level;
+			float3 HitUVz;
+			bool bHit;
+			bool bUncertain;
+			{
+				float3 DebugOutput;
+				CastScreenSpaceRay(
+					FurthestHZBTexture, FurthestHZBTextureSampler,
+					/* StartMipLevel = */ 1.0,
+					CreateDefaultCastSettings(),
+					Ray, RayRoughness, CONFIG_RAY_STEPS, StepOffset,
+					HZBUvFactorAndInvFactor, bDebugPrint,
+					/* out */ DebugOutput,
+					/* out */ HitUVz,
+					/* out */ Level,
+					/* out */ bHit,
+					/* out */ bUncertain);
+				
+				#if DEBUG_RAY_COUNT
+					DebugRayCount += 1.0;
+				#endif
+			}
+
+			// Ray is also uncertain if it has been clipped.
+			bUncertain = bUncertain || bRayWasClipped;
+
+			#if 0 // Backface check
+			if (bHit)
+			{
+				float3 SampleNormal = GetGBufferDataFromSceneTextures(HitUVz.xy).WorldNormal;
+				bHit = dot(SampleNormal, L) < 0;
+			}
+			#endif
+			
+			// if there was a hit
+			BRANCH
+			if (bHit)
+			{
+				float2 ReducedColorUV =  HitUVz.xy * ColorBufferScaleBias.xy + ColorBufferScaleBias.zw;
+				ReducedColorUV = min(ReducedColorUV, ReducedColorUVMax);
+
+				float4 SampleColor = ColorTexture.SampleLevel(ColorTextureSampler, ReducedColorUV, Level);
+				//SampleColor = float4(ReducedColorUV.xy, 0, 1);
+
+				float SampleColorWeight = 1.0;
+				#if CONFIG_KARIS_WEIGHTING
+					SampleColorWeight *= rcp( 1 + Luminance(SampleColor.rgb) );
+				#endif
+				
+				float3 DiffuseColor = SampleColor.rgb * SampleColorWeight;
+				float AmbientOcclusion = 1.0;
+				
+				#if CONFIG_COLOR_TILE_CLASSIFICATION
+				{
+					float Lumi = Luminance(DiffuseColor.rgb);
+					AmbientOcclusion *= saturate(Lumi / 0.25);
+				}
+				#endif
+
+				CompressedColor.x = asuint(f32tof16(DiffuseColor.r) << 16 | f32tof16(DiffuseColor.g));
+				CompressedColor.y = asuint(f32tof16(DiffuseColor.b) << 16 | f32tof16(AmbientOcclusion));
+			}
+			else
+			{
+				CompressedColor = uint2(0, 0);
+			}
+#endif // CUSTOM_SSGI_MODE == 1 && DIM_LIGHTING_TERM == DIFFUSE_TERM
+			
+		}
+		else // if (!bTraceRay)
+        {
+            CompressedColor = uint2(0, 0);
+        }
+		
+		// Output debugging info instead of actual intersection.
+		#if DEBUG_RAY_COUNT
+		{
+			CompressedColor.x = asuint(f32tof16(DebugRayCount) << 16);
+			CompressedColor.y = 0;
+		}
+		#endif
+		
+		uint DestPos = GroupPixelId + RaySequenceId * TILE_PIXEL_COUNT;
+			
+		SharedMemory0[LANE_PER_GROUPS * 0 | DestPos] = CompressedColor.x;
+		SharedMemory0[LANE_PER_GROUPS * 1 | DestPos] = CompressedColor.y;
+    }
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+	// Store ray to UAV
+	BRANCH
+	if (GroupThreadIndex < TILE_PIXEL_COUNT)
+	{
+		const uint GroupPixelId = GroupThreadIndex;
+	
+		float3 DiffuseColor = 0;
+		float AmbientOcclusion = 0;
+		uint SampleMask = 0;
+
+#if (CUSTOM_SSGI_MODE == 1 || CUSTOM_SSGI_MODE == 3) && DIM_LIGHTING_TERM == DIFFUSE_TERM
+		// SHADERSHIFT tile-local cross-bilateral denoiser (SSILVB + Stable SSGI).
+		//
+		// Each output pixel averages weighted samples from EVERY ray of EVERY
+		// pixel in the tile, weighted by a depth-similarity Gaussian.  Same
+		// surface = strong contribution, depth edge = zero contribution -- so
+		// the filter denoises within continuous surfaces without bleeding
+		// colour across object boundaries.
+		//
+		// Adjacent pixels' slices/rays are independent observations of the
+		// same incoming radiance field, so averaging them across a tile is
+		// statistically sound and reduces the spatial noise floor by
+		// sqrt(TILE_PIXEL_COUNT).
+		//
+		// History note for SSILVB (mode 1): the ORIGINAL pairing of this
+		// filter with a frame-STABLE jitter produced tile-sized smudges --
+		// the same few slice azimuths were blurred together forever and the
+		// engine's temporal accumulator received no new information.  The
+		// fix was NOT to drop the filter (raw per-frame SSILVB is too noisy
+		// even for the engine denoiser's 8-tap reconstruction) but to fix
+		// the sampling underneath it: slices now advance along an R2
+		// temporal sequence each frame, so this tile filter smooths a
+		// CONSTANTLY ROTATING fan and the engine's temporal accumulation
+		// then converges the result -- spatial filter for the noise floor,
+		// temporal integration for the directions.
+		float LocalDeviceZ = asfloat(SharedMemory1[GroupPixelId]);
+		float LocalDepth = LocalDeviceZ > 0.0f ? ConvertFromDeviceZ(LocalDeviceZ) : 0.0f;
+		float3 LocalNormal = DecompressN(SharedMemory1[TILE_PIXEL_COUNT | GroupPixelId]);
+		float WeightAccum = 0.0f;
+
+		UNROLL for (uint SrcPixel = 0u; SrcPixel < (uint)TILE_PIXEL_COUNT; ++SrcPixel)
+		{
+			float SrcDeviceZ = asfloat(SharedMemory1[SrcPixel]);
+			if (SrcDeviceZ <= 0.0f) continue;
+			float SrcDepth = ConvertFromDeviceZ(SrcDeviceZ);
+
+			// Joint depth + normal edge stops.
+			//
+			// Depth sigma is looser (6% vs the old 2%) because the normal weight
+			// now stops cross-surface bleed at corners where depths happen to be
+			// close (wall-meets-floor, object-meets-wall).  Looser depth lets
+			// ~3x more samples contribute on smooth surfaces -> noise floor
+			// drops by sqrt(3) on top of the existing tile averaging.
+			//
+			// Normal weight uses pow(saturate(dot(...)), 16) so the falloff is
+			// sharp -- aligned normals (cos > ~0.9) contribute fully, normals
+			// 30+ degrees off contribute < 0.1.  Preserves geometric edges with
+			// minimal smoothing across them.
+			float DepthDelta = abs(SrcDepth - LocalDepth);
+			float Sigma = max(LocalDepth, 1.0f) * 0.06f;
+			float DepthWeight = exp(-DepthDelta * DepthDelta / (2.0f * Sigma * Sigma));
+
+			float3 SrcNormal = DecompressN(SharedMemory1[TILE_PIXEL_COUNT | SrcPixel]);
+			float NormalWeight = pow(saturate(dot(SrcNormal, LocalNormal)), 16.0f);
+
+			float Weight = DepthWeight * NormalWeight;
+			if (SrcPixel == GroupPixelId) Weight = 1.0f;
+			if (Weight < 0.01f) continue;
+
+			UNROLL_N(CONFIG_RAY_COUNT)
+			for (uint k = 0u; k < CONFIG_RAY_COUNT; ++k)
+			{
+				uint SrcPos = SrcPixel + k * TILE_PIXEL_COUNT;
+				uint Row0 = SharedMemory0[LANE_PER_GROUPS * 0 | SrcPos];
+				uint Row1 = SharedMemory0[LANE_PER_GROUPS * 1 | SrcPos];
+				DiffuseColor.r += f16tof32(Row0 >> 16) * Weight;
+				DiffuseColor.g += f16tof32(Row0 >>  0) * Weight;
+				DiffuseColor.b += f16tof32(Row1 >> 16) * Weight;
+				AmbientOcclusion += f16tof32(Row1 >> 0) * Weight;
+			}
+			WeightAccum += Weight * float(CONFIG_RAY_COUNT);
+		}
+
+		if (WeightAccum > 0.0f)
+		{
+			float InvW = rcp(WeightAccum);
+			DiffuseColor *= InvW * float(CONFIG_RAY_COUNT);   // scale to per-ray mean (engine's UNROLL_N loop also sums to per-pixel)
+			AmbientOcclusion *= InvW * float(CONFIG_RAY_COUNT);
+		}
+#else
+		UNROLL_N(CONFIG_RAY_COUNT)
+		for (uint RaySequenceId = 0; RaySequenceId < CONFIG_RAY_COUNT; RaySequenceId++)
+		{
+			uint SrcPos = GroupPixelId + RaySequenceId * TILE_PIXEL_COUNT;
+
+			uint Row0 = SharedMemory0[LANE_PER_GROUPS * 0 | SrcPos];
+			uint Row1 = SharedMemory0[LANE_PER_GROUPS * 1 | SrcPos];
+
+			DiffuseColor.r += f16tof32(Row0 >> 16);
+			DiffuseColor.g += f16tof32(Row0 >>  0);
+			DiffuseColor.b += f16tof32(Row1 >> 16);
+			AmbientOcclusion += f16tof32(Row1 >> 0);
+
+			SampleMask |= (f16tof32(Row1 >> 0) > 0.0) ? (1u << RaySequenceId) : 0;
+		}
+#endif
+
+		#if CONFIG_RAY_COUNT > 1
+		{
+			DiffuseColor *= rcp(float(CONFIG_RAY_COUNT));
+			AmbientOcclusion *= rcp(float(CONFIG_RAY_COUNT));
+		}	
+		#endif
+		
+		// SHADERSHIFT: skip the Karis firefly unfold for the SSILVB diffuse path.
+		// Mode 1 wrote a clean (un-folded) per-slice sum, so the correct combine is
+		// the plain average above; unfolding here would distort it.  All other modes
+		// (incl. the stock ray cast and StableSSGI) keep the engine behaviour.
+		#if CONFIG_KARIS_WEIGHTING && !(CUSTOM_SSGI_MODE == 1 && DIM_LIGHTING_TERM == DIFFUSE_TERM)
+		{
+			DiffuseColor *= rcp( 1 - Luminance(DiffuseColor) );
+		}
+		#endif
+
+		// TODO Guillaume: need to have engine wide consistent solution for IndirectLightingColorScale.
+		//DiffuseColor *= View.IndirectLightingColorScale;
+		AmbientOcclusion = 1 - AmbientOcclusion;
+
+		uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+		uint2 OutputPixelCoordinate = ComputePixelPosition(GroupId, GroupPixelOffset);
+
+		// Output.
+		IndirectDiffuseOutput[OutputPixelCoordinate] = float4(DiffuseColor, 1.0);
+		AmbientOcclusionOutput[OutputPixelCoordinate] = AmbientOcclusion;
+	} // if (GroupThreadIndex < TILE_PIXEL_COUNT)
+} // MainCS()

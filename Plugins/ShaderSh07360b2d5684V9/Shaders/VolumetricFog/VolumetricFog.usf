@@ -1,0 +1,1578 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SHADERSHIFT MODIFIED -- see "ShaderShift Volumetric Fog Modes" block below.
+
+/*=============================================================================
+	VolumetricFog.usf
+	5.7-compatible version with custom volumetric fog modes from ShaderShift:
+	- Phase function dispatcher (HG / Schlick / Cornette-Shanks / Dual-Lobe HG / Mie-Approx)
+	- Schneider 2015 powder term in the integration pass
+	- R2 quasirandom sub-voxel jitter (more uniform than the engine PCG hash)
+=============================================================================*/
+
+#include "Common.ush"
+#include "Definitions.usf"
+#define SUPPORT_CONTACT_SHADOWS 0
+#define USE_SOURCE_TEXTURE USE_RECT_LIGHT_TEXTURE
+#include "DeferredLightingCommon.ush"
+#include "LightGridCommon.ush"
+#include "HeightFogCommon.ush"
+#include "SHCommon.ush"
+#if DISTANCE_FIELD_SKY_OCCLUSION
+#include "DistanceFieldAOShared.ush"
+#include "DistanceField/GlobalDistanceFieldShared.ush"
+#endif
+#include "VolumeLightingCommon.ush"
+#include "VolumetricLightmapShared.ush"
+#include "ReflectionEnvironmentShared.ush"
+#include "ForwardShadowingCommon.ush"
+#include "ParticipatingMediaCommon.ush"
+#include "LightDataUniforms.ush"
+#if LUMEN_GI
+#define FrontLayerTranslucencyReflectionsStruct LumenGIVolumeStruct
+#include "Lumen/LumenTranslucencyVolumeShared.ush"
+#endif
+#include "Random.ush"
+
+#if VIRTUAL_SHADOW_MAP
+#include "VirtualShadowMaps/VirtualShadowMapProjectionCommon.ush"
+#endif
+
+#if USE_LOCAL_FOG_VOLUMES
+#include "LocalFogVolumes/LocalFogVolumeCommon.ush"
+#endif
+
+#ifndef USE_EMISSIVE
+#define USE_EMISSIVE 1
+#endif
+
+#ifndef USE_RAYTRACED_SHADOWS
+#define USE_RAYTRACED_SHADOWS 0
+#endif
+
+RWTexture3D<float4> RWVBufferA;
+#if USE_EMISSIVE
+RWTexture3D<float4> RWVBufferB;
+#endif
+
+#if !SHADING_PATH_MOBILE
+#define USE_CLOUD_TRANSMITTANCE 1
+#include "VolumetricCloudCommon.ush"
+#endif
+
+float ComputeDepthFromZSlice(float ZSlice)
+{
+	float SliceDepth = (exp2(ZSlice / VolumetricFog.GridZParams.z) - VolumetricFog.GridZParams.y) / VolumetricFog.GridZParams.x;
+	return SliceDepth;
+}
+
+// SHADERSHIFT: inverse of ComputeDepthFromZSlice.  Maps a linear scene
+// depth back to the fractional Z slice index in the camera-frustum-aligned
+// froxel grid.  Used by WorldToFroxelCoord (below) when the secondary
+// ray-march for self-shadowing needs to look up the density volume at a
+// world-space sample position.
+float ComputeZSliceFromDepth(float SceneDepth)
+{
+	// Z = log2(SceneDepth * GridZParams.x + GridZParams.y) * GridZParams.z
+	float Inner = max(SceneDepth * VolumetricFog.GridZParams.x + VolumetricFog.GridZParams.y, 1e-6f);
+	return log2(Inner) * VolumetricFog.GridZParams.z;
+}
+
+// SHADERSHIFT: inverse of ComputeCellTranslatedWorldPosition.  Projects a
+// translated-world-space position back to integer froxel grid coordinates.
+// Returns int3(-1, -1, -1) when the sample is behind the camera or outside
+// the view frustum (caller checks bounds against VolumetricFog.ResourceGridSizeInt).
+int3 WorldToFroxelCoord(float3 TranslatedWorldPosition)
+{
+	float4 ClipPos = mul(float4(TranslatedWorldPosition, 1.0f), PrimaryView.TranslatedWorldToClip);
+	if (ClipPos.w <= 0.0f) { return int3(-1, -1, -1); }
+	float3 NDC = ClipPos.xyz / ClipPos.w;
+	float2 UV = NDC.xy * float2(0.5f, -0.5f) + 0.5f;
+	float2 GridXY = UV * VolumetricFog.ViewGridSize.xy;
+	// Use the homogeneous w as linear view-space depth (matches what
+	// ComputeCellTranslatedWorldPosition pipes through ConvertToDeviceZ).
+	float SceneDepth = ClipPos.w;
+	float ZSlice = ComputeZSliceFromDepth(SceneDepth);
+	return int3(int(GridXY.x), int(GridXY.y), int(ZSlice));
+}
+
+float4x4 UnjitteredClipToTranslatedWorld;    
+float4x4 UnjitteredPrevTranslatedWorldToClip;
+
+float3 ComputeCellTranslatedWorldPosition(uint3 GridCoordinate, float3 CellOffset, out float SceneDepth)
+{
+	float2 VolumeUV = (GridCoordinate.xy + CellOffset.xy) / VolumetricFog.ViewGridSize.xy;
+	float2 VolumeNDC = (VolumeUV * 2 - 1) * float2(1, -1);
+
+	SceneDepth = ComputeDepthFromZSlice(max(GridCoordinate.z + CellOffset.z, 0.0f));
+
+	float TileDeviceZ = ConvertToDeviceZ(SceneDepth);
+	float4 CenterPosition = mul(float4(VolumeNDC, TileDeviceZ, 1), UnjitteredClipToTranslatedWorld);
+	return CenterPosition.xyz / CenterPosition.w;
+}
+
+float3 ComputeCellTranslatedWorldPosition(uint3 GridCoordinate, float3 CellOffset)
+{
+	float Unused;
+	return ComputeCellTranslatedWorldPosition(GridCoordinate, CellOffset, Unused);
+}
+
+float3 RaleighScattering()
+{
+	float3 Wavelengths = float3(650.0f, 510.0f, 475.0f);
+	float ParticleDiameter = 60;
+	float ParticleRefractiveIndex = 1.3f;
+
+	float3 ScaleDependentPortion = pow(ParticleDiameter, 6) / pow(Wavelengths, 4);
+	float RefractiveIndexPortion = (ParticleRefractiveIndex * ParticleRefractiveIndex - 1) / (ParticleRefractiveIndex * ParticleRefractiveIndex + 2);
+	return (2 * pow(PI, 5) * RefractiveIndexPortion * RefractiveIndexPortion) * ScaleDependentPortion / 3.0f;
+}
+
+float3 ScatteringFunction()
+{
+	return 1;
+	//return RaleighScattering();
+}
+
+float4 GlobalAlbedo;
+float4 GlobalEmissive;
+float GlobalExtinctionScale;
+
+#ifndef THREADGROUP_SIZE 
+#define THREADGROUP_SIZE 1
+#endif
+
+#ifndef THREADGROUP_SIZE_X
+#define THREADGROUP_SIZE_X THREADGROUP_SIZE
+#endif
+
+#ifndef THREADGROUP_SIZE_Y
+#define THREADGROUP_SIZE_Y THREADGROUP_SIZE
+#endif
+
+#ifndef THREADGROUP_SIZE_Z
+#define THREADGROUP_SIZE_Z THREADGROUP_SIZE
+#endif
+
+#ifdef MaterialSetupCS
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void MaterialSetupCS( 
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+
+	// Center of the voxel
+	float VoxelOffset = .5f;
+	 
+	float3 WorldPosition = ComputeCellTranslatedWorldPosition(GridCoordinate, VoxelOffset) - DFHackToFloat(PrimaryView.PreViewTranslation);
+
+	float GlobalDensityFirst = FogStruct.ExponentialFogParameters3.x * exp2(-FogStruct.ExponentialFogParameters.y * (WorldPosition.z - FogStruct.ExponentialFogParameters3.y));
+	float GlobalDensitySecond = FogStruct.ExponentialFogParameters2.z * exp2(-FogStruct.ExponentialFogParameters2.y * (WorldPosition.z - FogStruct.ExponentialFogParameters2.w));
+	float GlobalDensity = GlobalDensityFirst + GlobalDensitySecond;
+
+	float3 Albedo = GlobalAlbedo.rgb;
+
+	// Exponential height fog interprets density differently, match its behavior
+	float MatchHeightFogFactor = .5f;
+	GlobalDensity *= MatchHeightFogFactor;
+	float Extinction = max(GlobalDensity * GlobalExtinctionScale, 0);
+
+	float3 Scattering = Albedo * Extinction;
+
+	float3 AdditionalEmissive = 0.0f;
+
+#if USE_LOCAL_FOG_VOLUMES
+	float CellOffset = .5f;
+	float SceneDepth;
+	const float3 TranslatedWorldPosition			= ComputeCellTranslatedWorldPosition(GridCoordinate, CellOffset, SceneDepth);
+	const float3 BackCellTranslatedWorldPosition	= ComputeCellTranslatedWorldPosition(GridCoordinate, float3(CellOffset, CellOffset, 1.0f), SceneDepth);
+	const float  DistanceToCellBack					= GetDistanceToCameraFromViewVector(BackCellTranslatedWorldPosition - PrimaryView.TranslatedWorldCameraOrigin);
+	if(DistanceToCellBack > LFVGlobalStartDistance)
+	{
+		const float3 FrontCellTranslatedWorldPosition	= ComputeCellTranslatedWorldPosition(GridCoordinate, float3(CellOffset, CellOffset, 0.0f), SceneDepth);
+		const float DistanceToCellFront					= GetDistanceToCameraFromViewVector(FrontCellTranslatedWorldPosition - PrimaryView.TranslatedWorldCameraOrigin);
+		float SoftDensityScale = 1;
+		if (DistanceToCellFront < LFVGlobalStartDistance && LFVGlobalStartDistance < DistanceToCellBack)
+		{
+			// Smoothly transition from the front clip planes of LFV to avoid bad straircase/aliasing visual effect.
+			// Extinction is basically scaled as a fonction of the start distance position inside the froxel along V.
+			SoftDensityScale = (DistanceToCellBack - LFVGlobalStartDistance) / max(0.0001, DistanceToCellBack - DistanceToCellFront);
+		}
+
+		float4 VertexClipSpacePosition = mul(float4(TranslatedWorldPosition.xyz, 1), PrimaryView.TranslatedWorldToClip);
+		float2 SvPosition = (VertexClipSpacePosition.xy / VertexClipSpacePosition.w * float2(.5f, -.5f) + .5f) * PrimaryView.ViewSizeAndInvSize.xy;
+		uint2 TilePos = clamp(uint2(SvPosition.xy / float(LFVTilePixelSize)), uint2(0, 0), LFVTileDataResolution - 1);
+
+		uint LFVCount = LFVTileDataTex[uint3(TilePos, 0)];
+
+		for (uint LFVIndex = 0; LFVIndex < LFVCount; ++LFVIndex)
+		{
+			uint InstanceIndex = LFVTileDataTex[uint3(TilePos, 1 + LFVIndex)];
+
+			// LFV_TODO skip if out of sphere of influence
+			FLocalFogVolumeGPUInstanceData FogInstance = GetLocalFogVolumeGPUInstanceData(InstanceIndex);
+
+			float3 UnitSpacePos = mul(TranslatedWorldPosition - FogInstance.TranslatedWorlPos, FogInstance.PreTranslatedInvTransform);
+
+			float DistToCenter = length(UnitSpacePos - float3(0.0f, 0.0f, 0.0f));
+			float SphereFade = saturate(1.0f - DistToCenter);
+
+			// Evaluate both radial and height local fog contribution
+			float LFVExtinctionHeight = SphereFade <= 0.0f ? 0.0f : FogInstance.HeightFogExtinction * exp(-FogInstance.HeightFogFalloff * (UnitSpacePos.z - FogInstance.HeightFogOffset));
+			float LFVExtinctionRadial = SphereFade <= 0.0f ? 0.0f : FogInstance.RadialFogExtinction * pow(SphereFade, 0.82); // 0.82 is a correction factor needed to get a better match. It is unclear why it is needed...
+
+			// As for the local fog volume analitical evaluation, we want to combine both two optical depth for the "opacity"=1-transmittance to be combined together.
+			// This helps to have soft edges when using height fog. 
+			/*
+			In this case, we have to find math so that the combined extinction resulting in a transmittance representing the multiplication of coverage = 1 - transmittance factors.
+
+			Reminder
+				Transmittance as T
+				Optical Depth as Tau
+				T   =  exp(-Tau)
+				Tau = -log(T)		(*)
+
+			We want to combine the both mode transmittance Tr (radial) and Th (height) as done in LocalFogVolumeEvaluateAnalyticalIntegral to have
+				 T		= 1 - (1-Tr)(1-Th)											// Where (1-Tr) is virtual coverage of the medium expressed from transmittance for the radial fog.
+				 T		= 1 - (1 - exp(-Tau_r)) (1 - exp(-Tau_h)))					// Where Tr = exp(-Tau_r)
+				-Tau	= log(1 - (1 - exp(-Tau_r)) (1 - exp(-Tau_h)))				// Using (*)
+				 Tau	=-log(exp(-Tau_r) - exp((-Tau_r-Tau_h) + exp(-Tau_h)))
+
+			Optical Depth Tau = Sigma_t * dt so it is linear with respect to dt and extinction Sigma_t. So we can also write
+				Sigma_T = -log(exp(-Sigma_T_r) - exp((-Sigma_T_r-Sigma_T_h) + exp(-Sigma_T_h)))
+
+			Factoring some values a bit we can get
+				A		= exp(-Sigma_T_r)
+				B		= exp(-Sigma_T_h)
+				Sigma_T	= -log(A - A*B + B)
+			*/
+
+			// Optical Depth is linear with Extinction so there is no need to account for the step length.
+			float FactorA = exp(-LFVExtinctionHeight);
+			float FactorB = exp(-LFVExtinctionRadial);
+			float LFVExtinction = -log(FactorA - FactorA * FactorB + FactorB);
+			LFVExtinction = max(0.0f, LFVExtinction);
+
+			// Convert extinction from unit volume 1/m into extinction for volumetric fog as 1/cm
+			LFVExtinction *= (1.0f / METER_TO_CENTIMETER);
+
+			LFVExtinction = min(LFVMaxDensityIntoVolumetricFog, LFVExtinction) * SoftDensityScale;
+
+			float3 LFVScattering = LFVExtinction * FogInstance.Albedo;
+
+			Scattering += LFVScattering;
+			Extinction += LFVExtinction;
+
+	#if USE_EMISSIVE
+			// Emissive follow the density of the medium
+			AdditionalEmissive += LFVExtinction * FogInstance.Emissive;
+	#endif
+		}
+	}
+#endif // USE_LOCAL_FOG_VOLUMES
+
+	if (all((int3)GridCoordinate < VolumetricFog.ResourceGridSizeInt))
+	{
+		RWVBufferA[GridCoordinate] = float4(Scattering, Extinction);
+#if USE_EMISSIVE
+		float3 HeightFogEmissive = GlobalEmissive.rgb;
+	#if PROJECT_EXPFOG_MATCHES_VFOG
+		HeightFogEmissive.rgb *= GlobalDensity; // Emissive needs to follow the height fog density for a better match
+	#endif 
+		RWVBufferB[GridCoordinate] = float4(HeightFogEmissive.rgb + AdditionalEmissive, 0);
+#endif
+	}
+}
+#endif
+
+//=============================================================================
+// ShaderShift Volumetric Fog Modes
+//
+// All ShaderShift behaviour is gated by these defines.  When every CUSTOM_VOL_*
+// value is at its engine-default, the shader compiles to byte-equivalent output
+// of the stock 5.7 VolumetricFog.usf.
+//
+// CUSTOM_VOL_PHASE_MODE -- selects the phase function used by the directional
+//   light, sky-SH zonal harmonic, local lights, and shadowed local lights.
+//   0 = Engine default -- Henyey-Greenstein (PBRT formulation, exact)
+//   1 = Schlick approximation to HG (~30% cheaper, indistinguishable for |g| < 0.5)
+//   2 = Cornette-Shanks (Mie improvement on HG, closer for clouds & fog)
+//   3 = Dual-Lobe HG -- sharp forward peak + soft secondary lobe, follows the
+//       pattern UE already uses in VolumetricCloud.usf for cloud Mie scattering
+//   4 = Jendersie & d'Eon 2023 approximate Mie -- closed-form blend of HG and
+//       Draine that matches ~95% of true Mie over a wide droplet-size range
+//
+// CUSTOM_VOL_PHASE_G2 -- secondary anisotropy for dual-lobe HG (mode 3).
+//   Range -1..1.  -0.3 = backscatter halo, +0.95 = sharp forward peak.
+//
+// CUSTOM_VOL_PHASE_BLEND -- blend factor for dual-lobe HG (mode 3).
+//   0 = primary lobe only, 1 = secondary lobe only.  Typical: 0.3
+//
+// CUSTOM_VOL_MIE_DROPLET_UM -- droplet diameter in micrometers for Mie-approx
+//   (mode 4).  5 = fine mist, 15 = fog, 50 = light cloud, 100+ = dense cloud
+//
+// CUSTOM_VOL_POWDER_BLEND -- Schneider 2015 powder term applied in the final
+//   integration pass.  Range 0..1.  0 = engine Beer-Lambert only.  ~0.5 gives
+//   the characteristic silver-lining glow at fog/cloud edges.
+//
+// CUSTOM_VOL_BLUE_NOISE -- replaces the per-supersample PCG hash in
+//   LightScatteringCS with a Martin Roberts R2 quasirandom sequence.  R2 has a
+//   blue-noise-like power spectrum, which TAA absorbs more cleanly than white
+//   noise.  Zero perf cost.  0 = engine Rand4DPCG32, 1 = R2 quasirandom
+//=============================================================================
+
+#ifndef CUSTOM_VOL_PHASE_MODE
+#define CUSTOM_VOL_PHASE_MODE 0
+#endif
+
+#ifndef CUSTOM_VOL_PHASE_G2
+#define CUSTOM_VOL_PHASE_G2 -0.3
+#endif
+
+#ifndef CUSTOM_VOL_PHASE_BLEND
+#define CUSTOM_VOL_PHASE_BLEND 0.3
+#endif
+
+#ifndef CUSTOM_VOL_MIE_DROPLET_UM
+#define CUSTOM_VOL_MIE_DROPLET_UM 15.0
+#endif
+
+#ifndef CUSTOM_VOL_POWDER_BLEND
+#define CUSTOM_VOL_POWDER_BLEND 0.0
+#endif
+
+// Integer toggle synthesised by the editor/runtime modules from
+// CUSTOM_VOL_POWDER_BLEND > 0.  HLSL's preprocessor only evaluates
+// integer constant expressions, so we need a real int for the #if gate
+// that lets the powder math be fully preprocessor-stripped when off.
+#ifndef CUSTOM_USE_POWDER
+#define CUSTOM_USE_POWDER 0
+#endif
+
+// CUSTOM_VOL_SELF_SHADOW_STEPS -- number of secondary ray-march taps from
+// each froxel toward the directional light, sampling the density volume
+// (VBufferA) to compute fog-on-fog self-shadowing.  Off (0) = engine
+// default (no self-shadow); typical values 4 / 8 / 16.  Cost scales
+// roughly linearly with step count.  Integer so HLSL's #if can gate it.
+#ifndef CUSTOM_VOL_SELF_SHADOW_STEPS
+#define CUSTOM_VOL_SELF_SHADOW_STEPS 0
+#endif
+
+// CUSTOM_VOL_MS_OCTAVES -- Phase B Wrenninge/Frostbite multi-octave
+// scattering approximation.  Each successive octave represents another
+// 'bounce' of light through the medium with attenuated phase anisotropy,
+// contribution, and shadow influence.  Together they approximate multi-
+// scattering without doing the full path-traced cost.
+//   0 = off  (engine default, single scattering only)
+//   2 = single + 1 bounce  (subtle, ~+20% cost on LightScatteringCS)
+//   3 = single + 2 bounces (recommended, ~+50% cost)
+//   4 = single + 3 bounces (cinematic, ~+80% cost)
+#ifndef CUSTOM_VOL_MS_OCTAVES
+#define CUSTOM_VOL_MS_OCTAVES 0
+#endif
+
+// CUSTOM_VOL_SPECTRAL_STRENGTH -- Phase C spectral fog modulation.
+// Approximates Rayleigh atmospheric extinction as a function of sun
+// elevation: low sun -> long atmospheric path -> blue light removed
+// preferentially -> directional light through fog turns orange/red
+// (the 'blue hour' / 'golden hour' effect).  High sun gives near-
+// neutral tint.  Range 0..2.  0 = off (engine baseline), 1 = physical-
+// ish, 2 = exaggerated cinematic.  Only affects directional light
+// contribution to fog scattering; sky and local lights are untouched.
+#ifndef CUSTOM_VOL_SPECTRAL_STRENGTH
+#define CUSTOM_VOL_SPECTRAL_STRENGTH 0.0
+#endif
+
+// Integer toggle synthesised by the editor/runtime modules from
+// CUSTOM_VOL_SPECTRAL_STRENGTH > 0.  Mirrors the CUSTOM_USE_POWDER
+// pattern so HLSL's #if can fully preprocessor-strip the spectral
+// math when off (HLSL only allows integer constant expressions in #if).
+#ifndef CUSTOM_USE_SPECTRAL
+#define CUSTOM_USE_SPECTRAL 0
+#endif
+
+#ifndef CUSTOM_VOL_BLUE_NOISE
+#define CUSTOM_VOL_BLUE_NOISE 0
+#endif
+
+// ---------------------------------------------------------------------------
+// Cornette-Shanks phase function (Mie improvement on Henyey-Greenstein)
+// Reference: Cornette & Shanks, Appl. Optics 1992.
+// ---------------------------------------------------------------------------
+float CornetteShanksPhase(float g, float CosTheta)
+{
+	float g2 = g * g;
+	float Numer = 3.0f * (1.0f - g2) * (1.0f + CosTheta * CosTheta);
+	float Denom = 2.0f * (2.0f + g2) * pow(abs(1.0f + g2 - 2.0f * g * CosTheta), 1.5f);
+	return Numer / (8.0f * PI * Denom);
+}
+
+// ---------------------------------------------------------------------------
+// Dual-Lobe Henyey-Greenstein -- same pattern as VolumetricCloud.usf:332-334
+// ---------------------------------------------------------------------------
+float DualLobeHGPhase(float g1, float g2, float blend, float CosTheta)
+{
+	float p1 = HenyeyGreensteinPhase(g1, CosTheta);
+	float p2 = HenyeyGreensteinPhase(g2, CosTheta);
+	return lerp(p1, p2, blend);
+}
+
+// ---------------------------------------------------------------------------
+// Jendersie & d'Eon 2023 -- approximate Mie scattering phase function
+// Closed-form blend of HG and Draine.  Matches ~95% of true Mie for spherical
+// water droplets over diameters in [5, 50] micrometers.
+// Reference: https://research.nvidia.com/labs/rtr/approximate-mie/
+// ---------------------------------------------------------------------------
+float DrainePhase(float alpha, float g, float CosTheta)
+{
+	float g2 = g * g;
+	float Numer = (1.0f - g2) * (1.0f + alpha * CosTheta * CosTheta);
+	float Denom = (1.0f + (alpha * (1.0f + 2.0f * g2)) / 3.0f)
+	            * pow(abs(1.0f + g2 - 2.0f * g * CosTheta), 1.5f);
+	return Numer / (4.0f * PI * Denom);
+}
+
+float MieApproxPhase(float DropletDiameter_um, float CosTheta)
+{
+	float d = DropletDiameter_um;
+	float g_hg = exp(-0.0990567f / (d - 1.67154f));
+	float g_d  = exp(-(2.20679f / (d + 3.91029f)) - 0.428934f);
+	float alpha_d = exp(3.62489f - (8.29288f / (d + 5.52825f)));
+	float w_d = exp(-(0.599085f / (d - 0.641583f)) - 0.665888f);
+	float p_hg = HenyeyGreensteinPhase(g_hg, CosTheta);
+	float p_d  = DrainePhase(alpha_d, g_d, CosTheta);
+	return (1.0f - w_d) * p_hg + w_d * p_d;
+}
+
+// Positive g = forward scattering
+// Zero g = isotropic
+// Negative g = backward scattering
+// === ShaderShift live-tweak macros (editor look-dev; see ShaderShiftRuntimeParams.h) ===
+// The View UB's HLSL symbol is `View` in EVERY pass of this file, including
+// FinalIntegrationCS.  (Its FParameters member is *named* ViewUniformBuffer —
+// VolumetricFog.cpp:1180 — but a STRUCT_REF's member name is only the C++
+// field; the HLSL cbuffer is always declared under the uniform buffer's own
+// shader name, and referencing `View.` in the source is what triggers the
+// declaration.  A previous revision wrongly used the member name as the HLSL
+// symbol, which failed to compile in FinalIntegrationCS.)  All macros are
+// lazy, expanding only where written.
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+// [generated] ShaderShift live-slot decode core (v3 banked) -- Build/gen_live_slots.py.  Do not hand-edit.
+// Focus lane (GeneralPurposeTweak==id) = full-precision knob being dragged now;
+// slot lanes = every dirty knob at 10-bit in the View *OverrideParameter floats
+// (code 1023 = clean -> baked default).  Armed marker = sign bit of BOTH the
+// Specular.x and Normal.x override params -- the only clamp-safe home:
+// SetupCommonViewUniformBufferParameters rewrites Diffuse.yzw + Roughness.y
+// pre-UB.  Mode-exclusive BRDF knobs share bank lanes (diffuse bank 0-16,
+// spec bank 17-20); the control lane (21) carries which diffuse/spec mode owns
+// each bank, so a non-owner knob reads its baked default, never a foreign code.
+#ifndef SSL_ARMED
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_ARMED(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#define SSL_CODE(SYM, MEMBER, LN) ((asuint(SYM.MEMBER) >> ((LN) * 10u)) & 0x3FFu)
+#define SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF) ((SSL_ARMED(SYM) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DEC(SYM, MEMBER, LN, LO, HI, DEF))
+#define SSL_CTRL(SYM) SSL_CODE(SYM, NormalOverrideParameter.w, 0u)
+#define SSL_DOWNER(SYM) (SSL_CTRL(SYM) & 0xFu)
+#define SSL_SOWNER(SYM) ((SSL_CTRL(SYM) >> 4u) & 0xFu)
+#define SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF) ((SSL_ARMED(SYM) && (OWN) && SSL_CODE(SYM, MEMBER, LN) != 1023u) ? ((LO) + ((HI) - (LO)) * ((float)SSL_CODE(SYM, MEMBER, LN) * (1.0 / 1022.0))) : (DEF))
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) ((round(SYM.GeneralPurposeTweak) == (ID)) ? SYM.GeneralPurposeTweak2 : SSL_DECB(SYM, MEMBER, LN, OWN, LO, HI, DEF))
+#else
+#define SSL_KNOB(SYM, ID, MEMBER, LN, LO, HI, DEF) (DEF)
+#define SSL_KNOBB(SYM, ID, MEMBER, LN, OWN, LO, HI, DEF) (DEF)
+#endif
+#endif // SSL_ARMED
+#ifndef SSL_KNOB_34
+#define SSL_KNOB_34(DEF) SSL_KNOB(View, 34.0, NormalOverrideParameter.w, 1u, 0.0, 2.0, DEF) // CUSTOM_VOL_SPECTRAL_STRENGTH [lane 22]
+#endif
+#ifndef SSL_KNOB_35
+#define SSL_KNOB_35(DEF) SSL_KNOB(View, 35.0, NormalOverrideParameter.w, 2u, -1.0, 1.0, DEF) // CUSTOM_VOL_PHASE_G2 [lane 23]
+#endif
+#ifndef SSL_KNOB_36
+#define SSL_KNOB_36(DEF) SSL_KNOB(View, 36.0, DiffuseOverrideParameter.x, 0u, 0.0, 1.0, DEF) // CUSTOM_VOL_PHASE_BLEND [lane 24]
+#endif
+#ifndef SSL_KNOB_37
+#define SSL_KNOB_37(DEF) SSL_KNOB(View, 37.0, DiffuseOverrideParameter.x, 1u, 1.0, 200.0, DEF) // CUSTOM_VOL_MIE_DROPLET_UM [lane 25]
+#endif
+#ifndef SSL_KNOB_38
+#define SSL_KNOB_38(DEF) SSL_KNOB(View, 38.0, DiffuseOverrideParameter.x, 2u, 0.0, 1.0, DEF) // CUSTOM_VOL_POWDER_BLEND [lane 26]
+#endif
+float PhaseFunction(float g, float CosTheta)
+{
+#if CUSTOM_VOL_PHASE_MODE == 1
+	return SchlickPhase(g, CosTheta);
+#elif CUSTOM_VOL_PHASE_MODE == 2
+	return CornetteShanksPhase(g, CosTheta);
+#elif CUSTOM_VOL_PHASE_MODE == 3
+	return DualLobeHGPhase(g, SSL_KNOB_35(CUSTOM_VOL_PHASE_G2), SSL_KNOB_36(CUSTOM_VOL_PHASE_BLEND), CosTheta);
+#elif CUSTOM_VOL_PHASE_MODE == 4
+	return MieApproxPhase(SSL_KNOB_37(CUSTOM_VOL_MIE_DROPLET_UM), CosTheta);
+#else
+	return HenyeyGreensteinPhase(g, CosTheta);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// MultiScatterPhaseShadow -- Phase B Wrenninge/Frostbite multi-octave
+// scattering approximation.
+//
+// Returns a (phase * shadow_factor) scalar that the call site multiplies
+// against (LightColor * LightFunctionColor) to get the final scattering
+// contribution.  When CUSTOM_VOL_MS_OCTAVES == 0 it short-circuits to the
+// engine baseline (single-scatter: phase * shadow).
+//
+// When MS_OCTAVES > 0, accumulates N octaves each with attenuated
+// anisotropy, contribution, and shadow influence:
+//   octave 0: full phase, full contribution, full shadow         (single scatter)
+//   octave 1: g*0.5, contrib*0.5, shadow lerped 50% toward 1    (1 bounce)
+//   octave 2: g*0.25, contrib*0.25, shadow lerped 75% toward 1  (2 bounces)
+//   ...
+// The shadow attenuation toward 1 is the key trick: bounced light reaches
+// shadowed regions because it's no longer travelling straight from the sun,
+// which is why dense fog interiors get the 'lit from within' look instead
+// of looking inky-black under pure single-scattering.
+//
+// Reference: Wrenninge 2015 'Art-Directable Multiple Volumetric Scattering',
+// Hillaire 2015 'Physically Based and Unified Volumetric Rendering in Frostbite'.
+// ---------------------------------------------------------------------------
+float MultiScatterPhaseShadow(float g, float CosTheta, float ShadowFactor)
+{
+#if CUSTOM_VOL_MS_OCTAVES == 0
+	return ShadowFactor * PhaseFunction(g, CosTheta);
+#else
+	float Result = 0.0f;
+	float AttenA = 1.0f;  // shadow influence (toward 1 = ignore shadow)
+	float AttenB = 1.0f;  // contribution weight
+	float AttenC = 1.0f;  // anisotropy strength
+	[unroll]
+	for (int Octave = 0; Octave < CUSTOM_VOL_MS_OCTAVES; ++Octave)
+	{
+		float OctavePhase  = PhaseFunction(g * AttenC, CosTheta);
+		float OctaveShadow = lerp(1.0f, ShadowFactor, AttenA);
+		Result += AttenB * OctaveShadow * OctavePhase;
+		AttenA *= 0.5f;
+		AttenB *= 0.5f;
+		AttenC *= 0.5f;
+	}
+	return Result;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// SpectralAtmosphericTint -- Phase C atmospheric spectral modulation.
+//
+// Approximates Rayleigh scattering removing shorter wavelengths preferentially
+// from sunlight that travels through more atmosphere.  At a low sun angle the
+// path through air is much longer, so blue is fully scattered out before
+// reaching the fog volume -- you see warm orange/red.  At high sun the path is
+// short and all wavelengths survive -- you see neutral white.
+//
+// Inputs:
+//   LightDir   -- normalised to-light direction (UE convention, Z = up)
+//                 LightDir.z = sin(sun elevation above horizon)
+//
+// Returns a per-channel transmittance tint to multiply into DirectionalLightColor.
+//
+// Reference: simplified Rayleigh model; coefficients tuned for visual effect
+// rather than strict physical accuracy (game-style cinematic shift).
+// ---------------------------------------------------------------------------
+float3 SpectralAtmosphericTint(float3 LightDir)
+{
+	// Sun elevation: positive Z = above horizon.  Floor near 0 so we don't
+	// divide by zero at exactly horizon.
+	float SinElevation = max(LightDir.z, 0.001f);
+
+	// Atmospheric path length (Chapman-Lambert approximation).  At zenith
+	// (SinElevation == 1) Path == 1; at horizon (SinElevation -> 0) Path
+	// grows large.  The 0.025 in the denominator softens the horizon blow-up.
+	float Path = 1.0f / sqrt(SinElevation * SinElevation + 0.025f * 0.025f);
+
+	// Relative Rayleigh extinction for RGB.  Roughly 1/lambda^4 ratios for
+	// the standard sRGB primary wavelengths (700/530/440 nm), normalised so
+	// strength = 1 gives a noticeable but natural sunset shift.
+	const float3 RayleighRGB = float3(0.28f, 0.68f, 1.65f);
+
+	// Beer-Lambert: long-path light gets blue removed first.  0.05 scale
+	// keeps strength = 1 in a reasonable physical range; user may push to 2
+	// for exaggerated golden-hour cinematic look.
+	float3 Transmittance = exp(-RayleighRGB * (Path * SSL_KNOB_34(CUSTOM_VOL_SPECTRAL_STRENGTH) * 0.05f));
+
+	return Transmittance;
+}
+
+struct FWriteToSliceVertexOutput
+{
+	FScreenVertexOutput Vertex;
+#if USING_VERTEX_SHADER_LAYER
+	uint LayerIndex : SV_RenderTargetArrayIndex;
+#else
+	uint LayerIndex : TEXCOORD1;
+#endif
+};
+
+/** Z index of the minimum slice in the range. */
+int MinZ;
+float4 ViewSpaceBoundingSphere;
+float4x4 ViewToVolumeClip;
+
+/** Vertex shader that writes to a range of slices of a volume texture. */
+void WriteToBoundingSphereVS(
+	float2 InPosition : ATTRIBUTE0,
+	float2 InUV       : ATTRIBUTE1,
+	uint LayerIndex : SV_InstanceID,
+	out FWriteToSliceVertexOutput Output
+	)
+{
+	float SliceDepth = ComputeDepthFromZSlice(LayerIndex + MinZ);
+	float SliceDepthOffset = abs(SliceDepth - ViewSpaceBoundingSphere.z);
+
+	if (SliceDepthOffset < ViewSpaceBoundingSphere.w)
+	{
+		// Compute the radius of the circle formed by the intersection of the bounding sphere and the current depth slice
+		float SliceRadius = sqrt(ViewSpaceBoundingSphere.w * ViewSpaceBoundingSphere.w - SliceDepthOffset * SliceDepthOffset);
+		// Place the quad vertex to tightly bound the circle
+		float3 ViewSpaceVertexPosition = float3(ViewSpaceBoundingSphere.xy + (InUV * 2 - 1) * SliceRadius, SliceDepth);
+		Output.Vertex.Position = mul(float4(ViewSpaceVertexPosition, 1), ViewToVolumeClip);
+		float2 ClipRatio = float2(1.0f, 1.0f);
+
+		// Scale rendered position to account for frustum difference between fog voxelization and rendered scene
+		Output.Vertex.Position.xy *= ClipRatio;
+	}
+	else
+	{
+		// Slice does not intersect bounding sphere, emit degenerate triangle
+		Output.Vertex.Position = 0;
+	}
+
+	// Debug - draw to entire texture in xy
+	//Output.Vertex.Position = float4(InUV * float2(2, -2) + float2(-1, 1), 0, 1);
+
+	Output.Vertex.UV = 0;
+	Output.LayerIndex = LayerIndex + MinZ;
+}
+
+float HistoryWeight;
+float LightScatteringSampleJitterMultiplier;
+float4 FrameJitterOffsets[16]; 
+uint HistoryMissSuperSampleCount;
+float PhaseG;
+float InverseSquaredLightDistanceBiasScale;
+int VirtualShadowMapId;
+
+#ifndef HISTORY_MISS_SUPER_SAMPLE_COUNT
+#define HISTORY_MISS_SUPER_SAMPLE_COUNT 1
+#endif
+
+#include "LightFunctionAtlas/LightFunctionAtlasCommon.usf"
+
+Texture2D<float> ConservativeDepthTexture;
+float2 PrevConservativeDepthTextureSize;
+Texture2D<float> PrevConservativeDepthTexture;
+uint UseConservativeDepthTexture;
+
+#if USE_RAYTRACED_SHADOWS
+
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+
+RaytracingAccelerationStructure TLAS;
+
+float ComputeRayTracedShadowFactor(float3 TranslatedWorldPosition, float3 LightDirection, float TMax)
+{
+	uint RayFlags = RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+	uint RaytracingMask = RAY_TRACING_MASK_SHADOW | RAY_TRACING_MASK_THIN_SHADOW;
+
+	FRayDesc Ray;
+	Ray.Origin = TranslatedWorldPosition;
+	Ray.Direction = LightDirection;
+	Ray.TMin = 0.0f;
+	Ray.TMax = TMax;
+
+	FMinimalPayload MinimalPayload = TraceVisibilityRay(
+		TLAS,
+		RayFlags,
+		RaytracingMask,
+		Ray);
+
+	if (MinimalPayload.IsHit())
+	{
+		return 0.0f;
+	}
+
+	return 1.0;
+}
+
+#endif
+
+float4 InjectShadowedLocalLightCommon(uint3 GridCoordinate)
+{
+	float4 OutScattering = 0;
+
+	// Somehow pixels are being rasterized outside of the viewport on a 970 GTX, perhaps due to use of a geometry shader bypassing the viewport scissor.
+	// This triggers the HistoryMissSuperSampleCount path causing significant overhead for shading off-screen pixels.
+	if (all(int3(GridCoordinate) < VolumetricFog.ResourceGridSizeInt))
+	{
+		FDeferredLightData LightData = InitDeferredLightFromUniforms();
+
+		float VolumetricScatteringIntensity = DeferredLightUniforms.VolumetricScatteringIntensity;
+
+		float3 L = 0;
+		float3 ToLight = 0;
+
+		uint NumSuperSamples = 1;
+
+#if USE_TEMPORAL_REPROJECTION
+		float3 HistoryUV = ComputeHistoryVolumeUVFromTranslatedPos(ComputeCellTranslatedWorldPosition(GridCoordinate, .5f), UnjitteredPrevTranslatedWorldToClip);
+		float HistoryAlpha = HistoryWeight;
+
+		FLATTEN
+		if (any(HistoryUV < 0) || any(HistoryUV > 1))
+		{
+			HistoryAlpha = 0;
+		}
+
+		NumSuperSamples = HistoryAlpha < .001f ? HistoryMissSuperSampleCount : 1;
+
+#endif
+		const bool bSoftFadeEnabled = VolumetricFog.LightSoftFading > 0;
+
+		for (uint SampleIndex = 0; SampleIndex < NumSuperSamples; SampleIndex++)
+		{
+			float3 CellOffset = FrameJitterOffsets[SampleIndex].xyz;
+			//float CellOffset = .5f;
+
+			float SceneDepth;
+			float3 TranslatedWorldPosition = ComputeCellTranslatedWorldPosition(GridCoordinate, CellOffset, SceneDepth);
+			float3 CameraVector = GetCameraVectorFromTranslatedWorldPosition(TranslatedWorldPosition);
+
+			float CellRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(GridCoordinate + uint3(1, 1, 1), CellOffset));
+			float Cell2DRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(GridCoordinate + uint3(1, 1, 0), CellOffset));
+			float LightVolumetricSoftFadeDistance = VolumetricFog.LightSoftFading * Cell2DRadius;
+			// Bias the inverse squared light falloff based on voxel size to prevent aliasing near the light source
+			float DistanceBias = max(CellRadius * InverseSquaredLightDistanceBiasScale, 1);
+
+			float3 LightColor = DeferredLightUniforms.Color;
+			float LightMask = GetLocalLightAttenuation(TranslatedWorldPosition, LightData, ToLight, L);
+
+			float Lighting;
+			if( LightData.bRectLight )
+			{
+				FRect Rect = GetRect(ToLight, LightData);
+
+				float SoftFade = 1.0f;
+#if USE_LIGHT_SOFT_FADING
+				if (bSoftFadeEnabled)
+				{
+					SoftFade = GetRectLightVolumetricSoftFading(LightData, Rect, LightVolumetricSoftFadeDistance, ToLight);
+				}
+#endif // USE_LIGHT_SOFT_FADING
+
+				Lighting = SoftFade * IntegrateLight(Rect);
+
+#if USE_RECT_LIGHT_TEXTURE
+				if (IsRectVisible(Rect))
+				{
+					const FRectTexture SourceTexture = ConvertToRectTexture(LightData);
+					const float3 FalloffColor = SampleSourceTexture(Lighting, Rect, SourceTexture);
+					LightColor *= FalloffColor;
+				}
+#endif // USE_RECT_LIGHT_TEXTURE
+			}
+			else
+			{
+				FCapsuleLight Capsule = GetCapsule(ToLight, LightData);
+				Capsule.DistBiasSqr = Pow2(DistanceBias);
+
+				float SoftFade = 1.0f;
+#if USE_LIGHT_SOFT_FADING
+				if (LightData.bSpotLight && bSoftFadeEnabled)
+				{
+					SoftFade = GetSpotLightVolumetricSoftFading(LightData, LightVolumetricSoftFadeDistance, ToLight);
+				}
+#endif // USE_LIGHT_SOFT_FADING
+
+				Lighting = SoftFade * IntegrateLight(Capsule, LightData.bInverseSquared);
+			}
+
+			float CombinedAttenuation = Lighting * LightMask;
+			float ShadowFactor = 1.0f;
+
+			bool IsPointLight = LightData.bRadialLight && !LightData.bSpotLight;
+	
+#if ENABLE_SHADOW_COMPUTATION
+			if (CombinedAttenuation > 0)
+			{
+#if USE_RAYTRACED_SHADOWS
+				ShadowFactor = ComputeRayTracedShadowFactor(TranslatedWorldPosition, normalize(ToLight), length(ToLight));
+#else
+				bool bUnused = false;
+				ShadowFactor = ComputeVolumeShadowing(TranslatedWorldPosition, IsPointLight, LightData.bSpotLight, bUnused);
+
+#if VIRTUAL_SHADOW_MAP
+				FVirtualShadowMapSampleResult VirtualShadowMapSample = SampleVirtualShadowMapTranslatedWorld(VirtualShadowMapId, TranslatedWorldPosition);
+				ShadowFactor *= VirtualShadowMapSample.ShadowFactor;
+#endif // VIRTUAL_SHADOW_MAP
+#endif // USE_RAYTRACED_SHADOWS
+			}
+#endif
+	
+			FLightFunctionColor LightFunctionColor = 1.0f;
+#if	USE_LIGHT_FUNCTION_ATLAS
+			LightFunctionColor = GetLocalLightFunctionCommon(TranslatedWorldPosition, LightData.LightFunctionAtlasLightIndex);
+#endif
+
+			// SHADERSHIFT Phase B: phase * shadow is fused into MultiScatterPhaseShadow,
+			// which evaluates N octaves of multi-scatter when CUSTOM_VOL_MS_OCTAVES > 0.
+			OutScattering.rgb += LightColor * LightFunctionColor * (MultiScatterPhaseShadow(PhaseG, dot(L, -CameraVector), ShadowFactor) * CombinedAttenuation * VolumetricScatteringIntensity);
+				
+			// To debug culling
+			//OutScattering.rgb += DeferredLightUniforms.Color * .0000001f;
+		}
+
+		// We pre-expose the buffer containing shadowed local lights luminance contribution. This helps maintaining details and color at high exposure for very bright scenes.
+		OutScattering.rgb *= View.PreExposure / (float)NumSuperSamples;
+	}
+
+	return OutScattering;
+}
+
+#if USE_RAYTRACED_SHADOWS
+
+RWTexture3D<float4> OutVolumeTexture;
+uint3 OutputOffset;
+int FirstSlice;
+
+int3 GetVoxelIndex(int ThreadIndex, int3 Resolution)
+{
+	int SliceSize = Resolution.x * Resolution.y;
+	int SliceIndex = ThreadIndex / SliceSize;
+	int SliceRemainder = ThreadIndex - SliceIndex * SliceSize;
+	
+	return int3(
+		SliceRemainder % Resolution.x,
+		SliceRemainder / Resolution.x,
+		SliceIndex
+	);
+}
+
+RAY_TRACING_ENTRY_RAYGEN(InjectShadowedLocalLightRGS)
+{
+	int3 Position = GetVoxelIndex(DispatchRaysIndex().x, VolumetricFog.ResourceGridSizeInt);
+	Position.z += FirstSlice;
+
+	float4 OutScattering = InjectShadowedLocalLightCommon(Position);
+
+	float4 DestValue = OutVolumeTexture[Position];
+	OutVolumeTexture[Position] = DestValue + OutScattering;
+}
+
+RWTexture3D<float> OutShadowVolumeTexture;
+
+RAY_TRACING_ENTRY_RAYGEN(InjectShadowedDirectionalLightRGS)
+{
+	int3 Position = GetVoxelIndex(DispatchRaysIndex().x, VolumetricFog.ResourceGridSizeInt);
+
+	const int SampleIndex = 0;
+	uint3 Rand32Bits = Rand4DPCG32(int4(Position.xyz, View.StateFrameIndexMod8 + 8 * SampleIndex)).xyz;
+	float3 Rand3D = (float3(Rand32Bits) / float(uint(0xffffffff))) * 2.0f - 1.0f;
+	float3 CellOffset = FrameJitterOffsets[SampleIndex].xyz + LightScatteringSampleJitterMultiplier * Rand3D;
+
+	const float3 TranslatedWorldPosition = ComputeCellTranslatedWorldPosition(Position, CellOffset);
+	OutShadowVolumeTexture[Position] = ComputeRayTracedShadowFactor(TranslatedWorldPosition, ForwardLightStruct.DirectionalLightDirection, 1.0e27);
+}
+
+#endif // USE_RAYTRACED_SHADOWS
+
+void InjectShadowedLocalLightPS(
+	FWriteToSliceGeometryOutput Input,
+	out float4 OutScattering : SV_Target0
+	)
+{
+	float4 SvPosition = Input.Vertex.Position;
+	OutScattering = 0;
+
+	if (UseConservativeDepthTexture > 0)
+	{
+		const float SceneDepth = ConservativeDepthTexture.Load(uint3(SvPosition.xy, 0));
+		if (SceneDepth > SvPosition.z)
+		{
+			clip(-1); // If the froxel is behind conservative front depth, skip the light injection.
+			return;
+		}
+	}
+
+	OutScattering = InjectShadowedLocalLightCommon(uint3(SvPosition.xy, Input.LayerIndex));
+}
+
+Texture3D<float4> VBufferA;
+Texture3D<float4> VBufferB;
+uint UseEmissive;
+
+Texture3D<float4> LightScatteringHistory;
+SamplerState LightScatteringHistorySampler;
+float2 LightScatteringHistoryPreExposureAndInv;
+
+Texture3D<float4> LocalShadowedLightScattering;
+
+RWTexture3D<float4> RWLightScattering;
+
+#if DISTANCE_FIELD_SKY_OCCLUSION
+
+float HemisphereConeTraceAgainstGlobalDistanceFieldClipmap(
+	uniform uint ClipmapIndex,
+	float3 TranslatedWorldShadingPosition,
+	float3 ConeDirection,
+	float TanConeHalfAngle)
+{
+	float MinStepSize = GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].w * 2 / 100.0f;
+	float InvAOGlobalMaxOcclusionDistance = 1.0f / AOGlobalMaxOcclusionDistance;
+
+	float MinVisibility = 1;
+	float WorldStepOffset = 2;
+
+	LOOP
+	for (uint StepIndex = 0; StepIndex < NUM_CONE_STEPS && WorldStepOffset < AOGlobalMaxOcclusionDistance; StepIndex++)
+	{
+		float3 TranslatedWorldSamplePosition = TranslatedWorldShadingPosition + ConeDirection * WorldStepOffset;
+		float DistanceToOccluder = SampleGlobalDistanceField(TranslatedWorldSamplePosition, AOGlobalMaxOcclusionDistance, ClipmapIndex);
+		float SphereRadius = WorldStepOffset * TanConeHalfAngle;
+		float InvSphereRadius = rcpFast(SphereRadius);
+
+		// Derive visibility from 1d intersection
+		float Visibility = saturate(DistanceToOccluder * InvSphereRadius);
+			
+		float OccluderDistanceFraction = (WorldStepOffset + DistanceToOccluder) * InvAOGlobalMaxOcclusionDistance;
+
+		// Fade out occlusion based on distance to occluder to avoid a discontinuity at the max AO distance
+		Visibility = max(Visibility, saturate(OccluderDistanceFraction * OccluderDistanceFraction * .6f));
+			
+		MinVisibility = min(MinVisibility, Visibility);
+
+		WorldStepOffset += max(DistanceToOccluder, MinStepSize);
+	}
+
+	return MinVisibility;
+}
+
+float HemisphereConeTraceAgainstGlobalDistanceField(float3 TranslatedWorldShadingPosition, float3 ConeDirection, float TanConeHalfAngle)
+{
+	int MinClipmapIndex = -1;
+	for (uint ClipmapIndex = 0; ClipmapIndex < NumGlobalSDFClipmaps; ++ClipmapIndex)
+	{
+		float DistanceFromClipmap = ComputeDistanceFromBoxToPointInside(GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].xyz, GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].www, TranslatedWorldShadingPosition);
+		if (DistanceFromClipmap > AOGlobalMaxOcclusionDistance)
+		{
+			MinClipmapIndex = ClipmapIndex;
+			break;
+		}
+	}
+
+	float MinVisibility = 1.0f;
+	if (MinClipmapIndex >= 0)
+	{
+		MinVisibility = HemisphereConeTraceAgainstGlobalDistanceFieldClipmap(MinClipmapIndex, TranslatedWorldShadingPosition, ConeDirection, TanConeHalfAngle);
+	}
+
+	return MinVisibility;
+}
+
+#endif
+
+float SkyLightUseStaticShadowing;
+
+float ComputeSkyVisibility(float3 TranslatedWorldPosition, float3 BrickTextureUVs)
+{
+	float Visibility = 1;
+
+#if DISTANCE_FIELD_SKY_OCCLUSION
+	// Trace one 45 degree cone straight up for sky occlusion
+	float TanConeHalfAngle = tan((float)PI / 4);
+
+	Visibility = HemisphereConeTraceAgainstGlobalDistanceField(TranslatedWorldPosition, float3(0, 0, 1), TanConeHalfAngle);
+	
+#endif
+
+#if ALLOW_STATIC_LIGHTING
+	if (SkyLightUseStaticShadowing > 0)
+	{
+		float3 SkyBentNormal = GetVolumetricLightmapSkyBentNormal(BrickTextureUVs);
+		Visibility = length(SkyBentNormal);
+	}
+#endif
+
+	return Visibility;
+}
+
+float4x4 DirectionalLightFunctionTranslatedWorldToShadow;
+Texture2D DirectionalLightLightFunctionTexture;
+SamplerState DirectionalLightLightFunctionSampler;
+uint DirectionalApplyLightFunctionFromAtlas;
+uint DirectionalLightFunctionAtlasLightIndex;
+
+FLightFunctionColor GetDirectionalLightFunction(float3 TranslatedWorldPosition) // directional light
+{
+#if USE_LIGHT_FUNCTION_ATLAS  // Used when injecting lights from the light grid
+	if (DirectionalApplyLightFunctionFromAtlas > 0)
+	{
+		return GetLocalLightFunctionCommon(TranslatedWorldPosition, DirectionalLightFunctionAtlasLightIndex);
+	}
+#endif
+
+	float4 HomogeneousShadowPosition = mul(float4(TranslatedWorldPosition, 1), DirectionalLightFunctionTranslatedWorldToShadow);
+	float2 LightFunctionUV = HomogeneousShadowPosition.xy * .5f + .5f;
+	LightFunctionUV.y = 1 - LightFunctionUV.y;
+
+	return Texture2DSampleLevel(DirectionalLightLightFunctionTexture, DirectionalLightLightFunctionSampler, LightFunctionUV, 0).x;
+}
+
+uint SampleSkyLightDiffuseEnvMap;
+float2 UseHeightFogColors;	// x=override directional light using height fog inscattering color, y=override sky light using heigh fog inscattering cubemap
+float UseDirectionalLightShadowing;
+float StaticLightingScatteringIntensity;
+
+#if SHADING_PATH_MOBILE
+uint   MobileHasDirectionalLight;
+float3 MobileDirectionalLightColor;
+float3 MobileDirectionalLightDirection;
+#endif
+
+Texture3D<float> RaytracedShadowsVolume;
+Texture3D<float3> MegaLightsVolume;
+
+// Modify UV used to sample LightScatteringHistory to avoid cells that were occluded last frame
+float2 FixupHistoryUV(float2 UV, float2 Size, float PrevCellNDCPositionZ, out bool bHasValidHistory)
+{
+	float2 FullResUV = UV * Size;
+
+	uint2 ScreenCoord = floor(FullResUV - 0.5f);
+	float2 BilinearWeights = frac(FullResUV - 0.5f);
+	float2 GatherUV = (ScreenCoord + 1.0f) / Size;
+
+	float2 FullResOffset = FullResUV - ScreenCoord;
+
+	const float2 PrevConservativeDepthGatherUV = GatherUV / (PrimaryView.VolumetricFogViewGridUVToPrevViewRectUV.xy * PrimaryView.VolumetricFogPrevViewGridRectUVToResourceUV.xy);
+	const float4 PrevSceneDepths = PrevConservativeDepthTexture.Gather(LightScatteringHistorySampler, PrevConservativeDepthGatherUV);
+	const bool4 ValidSamples = PrevSceneDepths < PrevCellNDCPositionZ;
+	
+	bHasValidHistory = true;
+
+	if (all(ValidSamples))
+	{
+		return UV;
+	}
+	
+	// Gather pattern:
+    // wz
+    // xy
+	
+	if (all(ValidSamples.wz))
+	{
+		return (ScreenCoord + float2(FullResOffset.x, 0.5f)) / Size;
+	}
+	if (all(ValidSamples.xy))
+	{
+		return (ScreenCoord + float2(FullResOffset.x, 1.5f)) / Size;
+	}
+	if (all(ValidSamples.wx))
+	{
+		return (ScreenCoord + float2(0.5f, FullResOffset.y)) / Size;
+	}
+	if (all(ValidSamples.zy))
+	{
+		return (ScreenCoord + float2(1.5f, FullResOffset.y)) / Size;
+	}
+
+	if (ValidSamples.x)
+	{
+		return (ScreenCoord + float2(0.5f, 1.5f)) / Size;
+	}
+
+	if (ValidSamples.y)
+	{
+		return (ScreenCoord + float2(1.5f, 1.5f)) / Size;
+	}
+
+	if (ValidSamples.w)
+	{
+		return (ScreenCoord + float2(0.5f, 0.5f)) / Size;
+	}
+
+	if (ValidSamples.z)
+	{
+		return (ScreenCoord + float2(1.5f, 0.5f)) / Size;
+	}
+
+	bHasValidHistory = false;
+	return UV;
+}
+
+#ifdef LightScatteringCS
+[numthreads(THREADGROUP_SIZE_X, THREADGROUP_SIZE_Y, THREADGROUP_SIZE_Z)]
+void LightScatteringCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+	float3 LightScattering = 0;
+	uint NumSuperSamples = 1;
+
+#if USE_TEMPORAL_REPROJECTION
+	float3 HistoryUV = ComputeHistoryVolumeUVFromTranslatedPos(ComputeCellTranslatedWorldPosition(GridCoordinate, .5f), UnjitteredPrevTranslatedWorldToClip);
+	bool bHasValidHistory = true;
+#endif
+
+	// If the froxel is behind front depth, do not evaluate any lighting.
+	if (UseConservativeDepthTexture > 0)
+	{
+		// expand by half voxel towards the camera to support bilinear filtering
+		const float3 FarDepthOffset = float3(0.5f, 0.5f, -0.5f);
+		float3 CellTranslatedWorldPosition = ComputeCellTranslatedWorldPosition(GridCoordinate, FarDepthOffset);
+
+		float4 CellNDCPosition = mul(float4(CellTranslatedWorldPosition, 1), PrimaryView.TranslatedWorldToClip);
+		CellNDCPosition.xyz /= CellNDCPosition.w;
+		float2 UVs = CellNDCPosition.xy * float2(0.5f, -0.5f) + 0.5f;
+
+		const float SceneDepth = ConservativeDepthTexture.Load(uint3(GridCoordinate.xy, 0));
+
+		if (SceneDepth > CellNDCPosition.z)
+		{
+			RWLightScattering[GridCoordinate] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+			return;
+		}
+
+#if USE_TEMPORAL_REPROJECTION
+		// TODO: investigate whether using CellTranslatedWorldPosition (which is biased towards camera) is correct here
+		// it might be more accurate to transform unbiased translated world position to previous frame clip space and apply bias towards camera in that space?
+		float4 PrevCellNDCPosition = mul(float4(CellTranslatedWorldPosition, 1), UnjitteredPrevTranslatedWorldToClip);
+		PrevCellNDCPosition.xyz /= PrevCellNDCPosition.w;
+
+		HistoryUV.xy = FixupHistoryUV(HistoryUV.xy, View.VolumetricFogPrevResourceGridSize.xy, PrevCellNDCPosition.z, bHasValidHistory);
+#endif
+	}
+
+#if USE_TEMPORAL_REPROJECTION
+	float HistoryAlpha = HistoryWeight;
+
+	// We need to test with View.VolumetricFogPrevUVMaxForTemporalBlend for HistoryUV because that is what we clamp with in ComputeHistoryVolumeUVFromTranslatedPos.
+	FLATTEN
+	if (any(HistoryUV < 0) || any(HistoryUV >= float3(View.VolumetricFogPrevUVMaxForTemporalBlend, 1.0f)) || !bHasValidHistory)
+	{
+		HistoryAlpha = 0;
+	}
+
+	// Supersample if the history was outside the camera frustum
+	// The compute shader is dispatched with extra threads, make sure those don't supersample
+	NumSuperSamples = HistoryAlpha < .001f && all(int3(GridCoordinate) < VolumetricFog.ViewGridSizeInt) ? HISTORY_MISS_SUPER_SAMPLE_COUNT : 1;
+#endif
+
+	for (uint SampleIndex = 0; SampleIndex < NumSuperSamples; SampleIndex++)
+	{
+	#if CUSTOM_VOL_BLUE_NOISE
+		// SHADERSHIFT: Martin Roberts R2 quasirandom sequence.  R2 has a
+		// blue-noise-like power spectrum (much closer to a true Poisson disk
+		// than the PCG hash below), so TAA absorbs the resulting frame-to-frame
+		// jitter as smooth motion rather than residual sparkle.  Zero perf cost.
+		// True R3 coefficients: powers of the 3D plastic number phi (~= 1.22074),
+		// not the 2D phi we shipped initially.  Marginally lower discrepancy in 3D.
+		float3 PerFrame = float(View.StateFrameIndexMod8 + 8 * SampleIndex)
+		                * float3(0.8191725f, 0.6710436f, 0.5497005f);
+		float3 PerFroxel = float3(GridCoordinate.xyz)
+		                 * float3(0.0823f, 0.0451f, 0.0739f);
+		float3 R2 = frac(0.5f + PerFrame + PerFroxel);
+		float3 Rand3D = R2 * 2.0f - 1.0f;
+	#else
+		uint3 Rand32Bits = Rand4DPCG32(int4(GridCoordinate.xyz, View.StateFrameIndexMod8 + 8 * SampleIndex)).xyz;
+		float3 Rand3D = (float3(Rand32Bits) / float(uint(0xffffffff))) * 2.0f - 1.0f;
+	#endif
+		float3 CellOffset = FrameJitterOffsets[SampleIndex].xyz + LightScatteringSampleJitterMultiplier * Rand3D;
+		//CellOffset = 0.5f;
+
+		float SceneDepth;
+		float3 TranslatedWorldPosition = ComputeCellTranslatedWorldPosition(GridCoordinate, CellOffset, SceneDepth);
+		float3 WorldPosition = TranslatedWorldPosition - DFHackToFloat(PrimaryView.PreViewTranslation); // LWC_TODO
+		float CameraVectorLength = GetDistanceToCameraFromViewVector(TranslatedWorldPosition - PrimaryView.TranslatedWorldCameraOrigin);
+		float3 CameraVector = GetCameraVectorFromTranslatedWorldPosition(TranslatedWorldPosition);
+		
+	#if SHADING_PATH_MOBILE
+		const bool	 bHasDirectionalLight		= MobileHasDirectionalLight > 0;
+		const float3 InDirectionalLightColor	= MobileDirectionalLightColor;	// DirectionalLightVolumetricScatteringIntensity is baked in MobileDirectionalLightColor
+		const float3 InDirectionalLightDirection= MobileDirectionalLightDirection;
+		const bool   bEvaluateDirectionalLight	= true;
+	#else
+		const bool	 bHasDirectionalLight		= ForwardLightStruct.HasDirectionalLight;
+		const float3 InDirectionalLightColor	= ForwardLightStruct.DirectionalLightColor * ForwardLightStruct.DirectionalLightVolumetricScatteringIntensity;
+		const float3 InDirectionalLightDirection= ForwardLightStruct.DirectionalLightDirection;
+		const bool   bEvaluateDirectionalLight	= !USE_MEGA_LIGHTS || !ForwardLightStruct.DirectionalLightHandledByMegaLights;
+	#endif
+		BRANCH
+		if (bHasDirectionalLight && bEvaluateDirectionalLight)
+		{
+			float ShadowFactor = 1;
+			
+			if (UseDirectionalLightShadowing > 0)
+			{
+				ShadowFactor *= ComputeDirectionalLightStaticShadowing(TranslatedWorldPosition);
+				bool bUnused = false;
+				ShadowFactor *= ComputeDirectionalLightDynamicShadowing(TranslatedWorldPosition, SceneDepth, bUnused);
+
+#if VIRTUAL_SHADOW_MAP
+				FVirtualShadowMapSampleResult VirtualShadowMapSample = SampleVirtualShadowMapTranslatedWorld(ForwardLightStruct.DirectionalLightVSM, TranslatedWorldPosition);
+				ShadowFactor *= VirtualShadowMapSample.ShadowFactor;
+#endif
+
+#if USE_RAYTRACED_SHADOWS_VOLUME
+				ShadowFactor *= RaytracedShadowsVolume[GridCoordinate];
+#endif
+
+#if !SHADING_PATH_MOBILE
+				if (CloudShadowmapStrength > 0.0f)
+				{
+					float OutOpticalDepth = 0.0f;
+					ShadowFactor *= lerp(1.0f, GetCloudVolumetricShadow(TranslatedWorldPosition, CloudShadowmapTranslatedWorldToLightClipMatrix, CloudShadowmapFarDepthKm, CloudShadowmapTexture, CloudShadowmapSampler, OutOpticalDepth), CloudShadowmapStrength);
+				}
+#endif
+			}
+
+		#if CUSTOM_VOL_SELF_SHADOW_STEPS > 0
+			// SHADERSHIFT: Phase A self-shadow.  Secondary ray-march from this
+			// froxel toward the sun, sampling the density volume (VBufferA, which
+			// the material injection pass populated earlier this frame) at each
+			// step.  Accumulates Beer-Lambert transmittance to produce a SelfShadow
+			// factor that multiplies into ShadowFactor -- giving dense fog the dark
+			// interiors and volumetric god-ray falloff that single-scattering misses.
+			//
+			// Step length is the diagonal of one froxel cell.  Loop is fully
+			// unrolled because CUSTOM_VOL_SELF_SHADOW_STEPS is a compile-time
+			// integer constant substituted by the editor/runtime modules.
+			{
+				// Distribute the taps over a meaningful march distance.  CellRadius
+				// alone (one froxel diagonal, typically 10-50cm at fog distance) gives
+				// total range below 4m even at 16 taps -- way too short to accumulate
+				// visible attenuation with default fog density.  Aim for ~10m of total
+				// march distance, clamped to >= one cell so we never oversample a cell.
+				float CellDiag = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(GridCoordinate + uint3(1, 1, 1), CellOffset));
+				float SelfShadowStep = max(CellDiag, 1000.0f / float(CUSTOM_VOL_SELF_SHADOW_STEPS));
+				float SelfShadow = 1.0f;
+				[unroll]
+				for (int SSI = 1; SSI <= CUSTOM_VOL_SELF_SHADOW_STEPS; ++SSI)
+				{
+					// InDirectionalLightDirection points FROM scene TOWARD light
+					// (confirmed by ComputeRayTracedShadowFactor call site: same vector
+					// is used as the to-light ray for ray-traced shadow tracing).
+					// Sample centred at (SSI-0.5)*step -> first sample at step/2, last at (N-0.5)*step,
+					// covering the full intended march distance N*step (was off-by-one-half-step).
+					float3 SamplePos = TranslatedWorldPosition + InDirectionalLightDirection * (SelfShadowStep * (float(SSI) - 0.5f));
+					int3 SampleGrid = WorldToFroxelCoord(SamplePos);
+					if (any(SampleGrid < int3(0, 0, 0)) || any(SampleGrid >= VolumetricFog.ResourceGridSizeInt))
+					{
+						break;
+					}
+					float SampleDensity = VBufferA[SampleGrid].w;
+					SelfShadow *= exp(-SampleDensity * SelfShadowStep);
+				}
+				ShadowFactor *= SelfShadow;
+			}
+		#endif
+
+			FLightFunctionColor LightFunctionColor = GetDirectionalLightFunction(TranslatedWorldPosition);
+
+			float3 DirectionalLightColor = InDirectionalLightColor;
+
+		#if CUSTOM_USE_SPECTRAL
+			// SHADERSHIFT Phase C: modulate the directional light color by the
+			// per-wavelength atmospheric transmittance for this sun elevation,
+			// producing the blue-hour / golden-hour spectral shift.  Applied
+			// before the optional UseHeightFogColors override so users who pick
+			// that path get their explicit color choice, not the spectral tint.
+			DirectionalLightColor *= SpectralAtmosphericTint(InDirectionalLightDirection);
+		#endif
+
+			if (UseHeightFogColors.x > 0)
+			{
+				// Attempt to maintain intensity ratio between sky and sun
+				DirectionalLightColor = VolumetricFog.HeightFogDirectionalLightInscatteringColor * Luminance(InDirectionalLightColor);
+			}
+
+			// SHADERSHIFT Phase B: phase * shadow fused; ShadowFactor here already
+			// includes Phase A self-shadow attenuation when CUSTOM_VOL_SELF_SHADOW_STEPS > 0.
+			LightScattering += DirectionalLightColor * LightFunctionColor * MultiScatterPhaseShadow(PhaseG, dot(InDirectionalLightDirection, -CameraVector), ShadowFactor);
+		}
+
+		FTwoBandSHVector RotatedHGZonalHarmonic;
+		RotatedHGZonalHarmonic.V = float4(1.0f, CameraVector.y, CameraVector.z, CameraVector.x) * float4(1.0f, PhaseG, PhaseG, PhaseG); // Note: I believe PhaseG here hsould be negated to match the sky & environment.
+
+		float3 BrickTextureUVs = 0;
+
+#if ALLOW_STATIC_LIGHTING
+		if (View.SkyLightVolumetricScatteringIntensity > 0 || StaticLightingScatteringIntensity > 0)
+		{
+			BrickTextureUVs = ComputeVolumetricLightmapBrickTextureUVs(WorldPosition);
+		}
+#endif
+
+#if LUMEN_GI
+
+		// Lumen Dynamic GI + shadowed Skylight
+		FTwoBandSHVectorRGB TranslucencyGISH = GetTranslucencyGIVolumeLighting(DFPromote(WorldPosition), PrimaryView.WorldToClip, false); // LUMEN_LWC_TODO
+
+		LightScattering += max(DotSH(TranslucencyGISH, RotatedHGZonalHarmonic), 0);
+
+#else
+		// Skylight
+		if (View.SkyLightVolumetricScatteringIntensity > 0)
+		{
+			float3 SkyLighting;
+
+			if (UseHeightFogColors.y > 0)
+			{
+				float3 HeightFogInscatteringColor = ComputeInscatteringColor(CameraVector, CameraVectorLength);
+				float ScalarFactor = SHAmbientFunction();
+				FTwoBandSHVectorRGB SkyIrradianceSH;
+				SkyIrradianceSH.R.V = float4(ScalarFactor * HeightFogInscatteringColor.r, 0, 0, 0);
+				SkyIrradianceSH.G.V = float4(ScalarFactor * HeightFogInscatteringColor.g, 0, 0, 0);
+				SkyIrradianceSH.B.V = float4(ScalarFactor * HeightFogInscatteringColor.b, 0, 0, 0);
+
+				SkyLighting = max(DotSH(SkyIrradianceSH, RotatedHGZonalHarmonic), 0);
+			}
+			else
+			{
+				// NOTE it should be CameraVector * PhaseG. But we keep it like that for backward compatibility for now. (visible when r.Lumen.TranslucencyVolume.Enable 0)
+				SkyLighting = SampleSkyLightDiffuseEnvMap > 0 ? View.SkyLightColor.rgb * GetSkySHDiffuseSimple(CameraVector * -PhaseG) : 0.0f.xxx;
+			}
+
+			float SkyVisibility = ComputeSkyVisibility(TranslatedWorldPosition, BrickTextureUVs);
+			LightScattering += (SkyVisibility * View.SkyLightVolumetricScatteringIntensity) * SkyLighting;
+		}
+#endif
+
+#if ALLOW_STATIC_LIGHTING
+		// Indirect lighting of Stationary lights and Direct + Indirect lighting of Static lights
+		if (StaticLightingScatteringIntensity > 0)
+		{
+			FTwoBandSHVectorRGB IrradianceSH = GetVolumetricLightmapSH2(BrickTextureUVs);
+
+			LightScattering += (StaticLightingScatteringIntensity / PI) * max(DotSH(IrradianceSH, RotatedHGZonalHarmonic), 0);
+		}
+#endif
+
+		uint GridIndex = ComputeLightGridCellIndex(GridCoordinate.xy * VolumetricFog.FogGridToPixelXY, SceneDepth, 0);
+		const FCulledLightsGridHeader CulledLightsGridHeader = GetCulledLightsGridHeader(GridIndex);
+
+		float CellRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(GridCoordinate + uint3(1, 1, 1), CellOffset));
+		float Cell2DRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(GridCoordinate + uint3(1, 1, 0), CellOffset));
+		float LightVolumetricSoftFadeDistance = VolumetricFog.LightSoftFading * Cell2DRadius;
+		// Bias the inverse squared light falloff based on voxel size to prevent aliasing near the light source
+		float DistanceBiasSqr = max(CellRadius * InverseSquaredLightDistanceBiasScale, 1);
+		DistanceBiasSqr *= DistanceBiasSqr;
+
+#if USE_MEGA_LIGHTS
+		// when using Mega Lights Volume only need to apply "non-mega" lights here
+		const uint NumLights = CulledLightsGridHeader.NumLights - CulledLightsGridHeader.NumMegaLights;
+#else
+		const uint NumLights = CulledLightsGridHeader.NumLights;
+#endif
+
+		// Forward lighting of unshadowed point and spot lights
+		LOOP
+		for (uint GridLightListIndex = 0; GridLightListIndex < NumLights; GridLightListIndex++)
+		{
+			const FLocalLightData LocalLight = GetLocalLightDataFromGrid(CulledLightsGridHeader.DataStartIndex + GridLightListIndex, 0);
+#if USE_MEGA_LIGHTS
+			checkSlow(!UnpackIsHandledByMegaLights(LocalLight));
+#endif
+
+			const float VolumetricScatteringIntensity = UnpackVolumetricScatteringIntensity(LocalLight);
+
+			if (VolumetricScatteringIntensity > 0)
+			{
+				const bool bSoftFadeEnabled = VolumetricFog.LightSoftFading > 0;
+#if SHADING_PATH_MOBILE
+				const FDeferredLightData LightData = ConvertToDeferredLight_Mobile(LocalLight);
+#else
+				const FDeferredLightData LightData = ConvertToDeferredLight(LocalLight);
+#endif
+
+				float3 L = 0;
+				float3 ToLight = 0;
+				float LightMask = GetLocalLightAttenuation(TranslatedWorldPosition, LightData, ToLight, L);
+
+				float Lighting;
+				if( LightData.bRectLight )
+				{
+					FRect Rect = GetRect( ToLight, LightData );
+
+					float SofFade = 1.0f;
+#if USE_LIGHT_SOFT_FADING
+					if (bSoftFadeEnabled)
+					{
+						SofFade = GetRectLightVolumetricSoftFading(LightData, Rect, LightVolumetricSoftFadeDistance, ToLight);
+					}
+#endif // USE_LIGHT_SOFT_FADING
+
+					Lighting = SofFade * IntegrateLight(Rect);
+				}
+				else
+				{
+					FCapsuleLight Capsule = GetCapsule(ToLight, LightData);
+					Capsule.DistBiasSqr = DistanceBiasSqr;
+
+					float SofFade = 1.0f;
+#if USE_LIGHT_SOFT_FADING
+					if (LightData.bSpotLight && bSoftFadeEnabled)
+					{
+						SofFade = GetSpotLightVolumetricSoftFading(LightData, LightVolumetricSoftFadeDistance, ToLight);
+					}
+#endif // USE_LIGHT_SOFT_FADING
+
+					Lighting = SofFade;
+#if !SHADING_PATH_MOBILE
+					// Mobile is already getting the Falloff from GetLocalLightAttenuation
+					Lighting *= IntegrateLight(Capsule, LightData.bInverseSquared);
+#endif	
+				}
+
+				float CombinedAttenuation = Lighting * LightMask;
+
+				FLightFunctionColor LightFunctionColor = 1.0f;
+			#if	USE_LIGHT_FUNCTION_ATLAS
+				LightFunctionColor = GetLocalLightFunctionCommon(TranslatedWorldPosition, LightData.LightFunctionAtlasLightIndex);
+			#endif
+
+				// SHADERSHIFT Phase B: forward (unshadowed) local lights pass ShadowFactor=1
+				// so multi-scatter still accumulates octaves without an additional shadow term.
+				LightScattering += LightData.Color * LightFunctionColor * (MultiScatterPhaseShadow(PhaseG, dot(L, -CameraVector), 1.0f) * CombinedAttenuation * VolumetricScatteringIntensity);
+
+				// To debug culling
+				//LightScattering += UnpackLightColor(LocalLight) * .0000001f;
+			}
+		}
+	}
+
+	LightScattering /= (float)NumSuperSamples;
+
+	// Shadowed point and spot lights were computed earlier. 
+	// Note: this texture was pre-exposed from InjectShadowedLocalLightPS, se we revert pre-exposure.
+	LightScattering += View.OneOverPreExposure * LocalShadowedLightScattering[GridCoordinate].xyz;
+
+	#if USE_MEGA_LIGHTS
+	{
+		// Inject MegaLights which were computed earlier. This texture was already pre-exposed, so need to rever it here.
+		LightScattering += MegaLightsVolume[GridCoordinate] * View.OneOverPreExposure;
+	}
+	#endif
+
+	float4 MaterialScatteringAndExtinction = VBufferA[GridCoordinate];
+	float Extinction = MaterialScatteringAndExtinction.w;
+	float3 MaterialEmissive = 0.0f;
+	BRANCH
+	if (UseEmissive > 0)
+	{
+		MaterialEmissive = VBufferB[GridCoordinate].xyz;
+	}
+	float4 PreExposedScatteringAndExtinction = float4(View.PreExposure * (LightScattering * MaterialScatteringAndExtinction.xyz + MaterialEmissive), Extinction);
+
+#if USE_TEMPORAL_REPROJECTION
+	BRANCH
+	if (HistoryAlpha > 0)
+	{
+		float4 PreExposedHistoryScatteringAndExtinction = Texture3DSampleLevel(LightScatteringHistory, LightScatteringHistorySampler, min(HistoryUV, float3(View.VolumetricFogPrevUVMax, 1.0f)), 0);
+		PreExposedHistoryScatteringAndExtinction.rgb *= LightScatteringHistoryPreExposureAndInv.y * View.PreExposure; // Bring previous frame pre exposed history luminance as current frame pre exposed luminance. Leave extinction untouched! 
+		PreExposedScatteringAndExtinction = lerp(PreExposedScatteringAndExtinction, PreExposedHistoryScatteringAndExtinction, HistoryAlpha);
+	}
+	
+#endif
+
+	// Visualize history rejection for debugging purposes
+#if 0 && USE_TEMPORAL_REPROJECTION
+	if (HistoryAlpha < 0.001f)
+	{
+		PreExposedScatteringAndExtinction = float4(View.PreExposure * float3(1,0,0), Extinction);
+	}
+#endif
+
+	if (all(int3(GridCoordinate) < VolumetricFog.ResourceGridSizeInt))
+	{
+		PreExposedScatteringAndExtinction = MakePositiveFinite(PreExposedScatteringAndExtinction);
+		RWLightScattering[GridCoordinate] = PreExposedScatteringAndExtinction;
+	}
+}
+#endif
+
+Texture3D<float4> LightScattering;
+RWTexture3D<float4> RWIntegratedLightScattering;
+
+float VolumetricFogNearFadeInDistanceInv;
+
+#ifdef FinalIntegrationCS
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void FinalIntegrationCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+
+	float3 AccumulatedLighting = 0;
+	float AccumulatedTransmittance = 1.0f;
+	float3 PreviousSliceTranslatedWorldPosition = ComputeCellTranslatedWorldPosition(uint3(GridCoordinate.xy, 0), float3(0.5f, 0.5f, 0.0f));
+	float AccumulatedDepth = 0.0;
+	for (int LayerIndex = 0; LayerIndex < VolumetricFog.ViewGridSizeInt.z; LayerIndex++)
+	{
+		uint3 LayerCoordinate = uint3(GridCoordinate.xy, LayerIndex);
+		float4 PreExposedScatteringAndExtinction = LightScattering[LayerCoordinate];
+
+		float3 LayerTranslatedWorldPosition = ComputeCellTranslatedWorldPosition(LayerCoordinate, .5f);
+		float StepLength = length(LayerTranslatedWorldPosition - PreviousSliceTranslatedWorldPosition);
+		PreviousSliceTranslatedWorldPosition = LayerTranslatedWorldPosition;
+
+		float Transmittance = exp(-PreExposedScatteringAndExtinction.w * StepLength);
+
+	#if CUSTOM_USE_POWDER
+		// SHADERSHIFT: Schneider 2015 "powder" term.  Adds the silver-lining /
+		// edge-glow that thin slabs of high-albedo media exhibit (sunlit fog edge,
+		// backlit cloud).  Multiplicative boost on per-slice scattering, scaled by
+		// user blend.  Reference: Schneider & Vos, "The Real-time Volumetric
+		// Cloudscapes of Horizon Zero Dawn", SIGGRAPH 2015.
+		//
+		// Gated by integer CUSTOM_USE_POWDER (synthesised by the editor/runtime
+		// modules as 1 iff CUSTOM_VOL_POWDER_BLEND > 0).  When the user has the
+		// powder off, the entire block is preprocessor-stripped -- zero per-slice
+		// ALU cost, byte-equivalent output to the engine baseline.  The blend
+		// amount stays a float tunable inside the gate.
+		// Schneider 2015 powder term, reshaped for additive use on top of UE's
+		// existing energy-conserving integral.  The original Beer*Powder form
+		// only works inside a from-scratch raymarcher; multiplying it onto
+		// already-integrated scattering would darken thin edges (silver lining
+		// inverted).  Instead use a one-sided brightening:
+		//   thin fog (Powder ~ 0)  -> multiplier ~ 1   (no change vs engine)
+		//   dense fog (Powder ~ 1) -> multiplier ~ 1 + blend  (silver-lining glow)
+		float Powder = 1.0f - exp(-2.0f * PreExposedScatteringAndExtinction.w * StepLength);
+		float3 PoweredScattering = PreExposedScatteringAndExtinction.rgb
+		                         * (1.0f + SSL_KNOB_38(CUSTOM_VOL_POWDER_BLEND) * Powder);
+	#else
+		float3 PoweredScattering = PreExposedScatteringAndExtinction.rgb;
+	#endif
+
+		AccumulatedDepth += StepLength;
+
+		// Fade in as a function of depth
+		float FadeInLerpValue = saturate(AccumulatedDepth * VolumetricFogNearFadeInDistanceInv);
+
+		// See "Physically Based and Unified Volumetric Rendering in Frostbite"
+		#define ENERGY_CONSERVING_INTEGRATION 1
+		#if ENERGY_CONSERVING_INTEGRATION
+			float3 ScatteringIntegratedOverSlice = FadeInLerpValue * (PoweredScattering - PoweredScattering * Transmittance) / max(PreExposedScatteringAndExtinction.w, .00001f);
+			AccumulatedLighting += ScatteringIntegratedOverSlice * AccumulatedTransmittance;
+		#else
+			AccumulatedLighting += FadeInLerpValue * PoweredScattering * AccumulatedTransmittance * StepLength;
+		#endif
+		
+		AccumulatedTransmittance *= lerp(1.0f, Transmittance, FadeInLerpValue);
+
+		RWIntegratedLightScattering[LayerCoordinate] = float4(AccumulatedLighting, AccumulatedTransmittance);
+	}
+}
+#endif
