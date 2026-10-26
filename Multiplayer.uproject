@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "5.7",
+	"EngineAssociation": "{080896CC-404C-51EC-09DB-DE9470DA2825}",
 	"Category": "",
 	"Description": "",
 	"Modules": [
@@ -125,7 +125,7 @@
 		},
 		{
 			"Name": "SnapSystem",
-			"Enabled": true,
+			"Enabled": false,
 			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/fa834687594944f5aafe2be8b44ad3f1"
 		},
 		{
