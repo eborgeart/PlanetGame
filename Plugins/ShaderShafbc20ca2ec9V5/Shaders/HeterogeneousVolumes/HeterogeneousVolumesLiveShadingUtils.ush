@@ -1,0 +1,90 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// [generated] ShaderShift live-lane neutralization -- Build/gen_live_slots.py.
+// When the ShaderShift live-tweak marker is armed, the View *OverrideParameter
+// members carry live-slot data, so the editor-viewmode override transforms must
+// not be applied.  Unarmed (or SHADERSHIFT_LIVE_TWEAKS==0) is engine-identical.
+#ifndef SHADERSHIFT_LIVE_TWEAKS
+#define SHADERSHIFT_LIVE_TWEAKS 1
+#endif
+#ifndef SSL_NEUTRAL
+#if SHADERSHIFT_LIVE_TWEAKS
+#define SSL_NEUTRAL(SYM) ((asuint(SYM.SpecularOverrideParameter.x) & asuint(SYM.NormalOverrideParameter.x) & 0x80000000u) != 0u)
+#else
+#define SSL_NEUTRAL(SYM) false
+#endif
+#endif
+
+
+// Change this to force recompilation of all shaders referencing this file.
+#pragma message("UESHADERMETADATA_VERSION 80584AA0-BFD9-4021-BE67-273077B48601")
+
+FPrimitiveSceneData GetPrimitiveData(
+	uint PrimitiveId,
+	float4x4 LocalToWorld,
+	float4x4 WorldToLocal,
+	float3 LocalBoundsOrigin,
+	float3 LocalBoundsExtent
+)
+{
+	FPrimitiveSceneData PrimitiveData = GetPrimitiveData(PrimitiveId);
+
+	// Replace local-space transforms..
+	PrimitiveData.LocalToWorld = DFPromote(LocalToWorld);
+	PrimitiveData.WorldToLocal = DFPromoteInverse(WorldToLocal);
+	PrimitiveData.LocalObjectBoundsMin = LocalBoundsOrigin - LocalBoundsExtent;
+	PrimitiveData.LocalObjectBoundsMax = LocalBoundsOrigin + LocalBoundsExtent;
+
+	return PrimitiveData;
+}
+
+FPrimitiveSceneData GetPrimitiveData(FMaterialVertexParameters Parameters, float4x4 LocalToWorld, float4x4 WorldToLocal, float3 LocalBoundsOrigin, float3 LocalBoundsExtent)
+{
+	return GetPrimitiveData(Parameters.PrimitiveId, LocalToWorld, WorldToLocal, LocalBoundsOrigin, LocalBoundsExtent);
+}
+
+FPrimitiveSceneData GetPrimitiveData(FMaterialPixelParameters Parameters, float4x4 LocalToWorld, float4x4 WorldToLocal, float3 LocalBoundsOrigin, float3 LocalBoundsExtent)
+{
+	return GetPrimitiveData(Parameters.PrimitiveId, LocalToWorld, WorldToLocal, LocalBoundsOrigin, LocalBoundsExtent);
+}
+
+// Stolen from VolumetricFog
+float3 SampleExtinctionCoefficients(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	float3 Extinction = 0.0f;
+#if TEMPLATE_USES_SUBSTRATE
+	FSubstrateBSDF BSDF = PixelMaterialInputs.FrontMaterial.InlinedBSDF;
+	Extinction = VOLUMETRICFOGCLOUD_EXTINCTION(BSDF).rgb;
+#else
+#if !MATERIAL_SHADINGMODEL_UNLIT
+	Extinction = GetMaterialSubsurfaceDataRaw(PixelMaterialInputs).rgb;
+#endif
+#endif
+	return clamp(Extinction, 0.0f, 65000.0f);
+}
+
+float3 SampleEmissive(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	float3 EmissiveColor = 0.0f;
+#if TEMPLATE_USES_SUBSTRATE
+	FSubstrateBSDF BSDF = PixelMaterialInputs.FrontMaterial.InlinedBSDF;
+	EmissiveColor = BSDF_GETEMISSIVE(BSDF);
+#else
+	EmissiveColor = GetMaterialEmissiveRaw(PixelMaterialInputs);
+#endif
+	return clamp(EmissiveColor, 0.0f, 65000.0f);
+}
+
+float3 SampleAlbedo(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	float3 Albedo = 0.0f;
+#if TEMPLATE_USES_SUBSTRATE
+	FSubstrateBSDF BSDF = PixelMaterialInputs.FrontMaterial.InlinedBSDF;
+	Albedo = VOLUMETRICFOGCLOUD_ALBEDO(BSDF);
+#else
+#if !MATERIAL_SHADINGMODEL_UNLIT
+	Albedo = GetMaterialBaseColor(PixelMaterialInputs);
+#endif
+#endif
+	return SSL_NEUTRAL(View) ? (saturate(Albedo)) : (saturate(Albedo) * View.DiffuseOverrideParameter.w + View.DiffuseOverrideParameter.xyz); // ShaderShift live-lane guard
+}
